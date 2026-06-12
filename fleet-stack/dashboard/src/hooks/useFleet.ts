@@ -10,6 +10,7 @@ export function useFleet() {
     queryFn: () => getJSON<FleetSummary>('/api/fleet'),
     refetchInterval: FLEET_POLL_MS,
     staleTime: FLEET_POLL_MS,
+    retry: 0,
     placeholderData: prev => prev, // keep last data on refetch error
   })
 }

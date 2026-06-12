@@ -21,7 +21,7 @@ export default function App() {
         </aside>
         <main className="min-w-0 flex-1">
           {selectedId ? (
-            <BusDetail busId={selectedId} />
+            <BusDetail key={selectedId} busId={selectedId} />
           ) : (
             <div className="grid h-full place-items-center text-ink-dim">
               <div className="text-center">

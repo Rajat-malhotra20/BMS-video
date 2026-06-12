@@ -45,6 +45,10 @@ export async function startWhep(
     pc.close()
     throw new Error(`WHEP ${path}: HTTP ${res.status}`)
   }
+  if (signal.aborted) {
+    pc.close()
+    throw new Error(`WHEP ${path}: aborted`)
+  }
   await pc.setRemoteDescription({ type: 'answer', sdp: await res.text() })
 
   return {

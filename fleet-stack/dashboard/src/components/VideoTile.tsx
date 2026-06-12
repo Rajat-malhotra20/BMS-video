@@ -29,6 +29,7 @@ export default function VideoTile({ path, label, ready, onClick, large }: Props)
     let whep: WhepSession | null = null
     let hls: Hls | null = null
     let retryTimer: number | undefined
+    let frameTimer: number | undefined
     let attempt = 0
     const abort = new AbortController()
 
@@ -50,6 +51,7 @@ export default function VideoTile({ path, label, ready, onClick, large }: Props)
 
     const startHls = () => {
       if (cancelled) return
+      video.onplaying = null
       cleanupPlayers()
       const src = `/live/${path}/index.m3u8`
       if (video.canPlayType('application/vnd.apple.mpegurl')) {
@@ -71,9 +73,14 @@ export default function VideoTile({ path, label, ready, onClick, large }: Props)
     const start = async () => {
       if (cancelled) return
       setState('connecting')
-      const frameTimer = window.setTimeout(startHls, FIRST_FRAME_TIMEOUT_MS)
+      frameTimer = window.setTimeout(startHls, FIRST_FRAME_TIMEOUT_MS)
       try {
         whep = await startWhep(path, video, abort.signal)
+        if (cancelled) {
+          whep.close()
+          whep = null
+          return
+        }
         video.onplaying = () => {
           window.clearTimeout(frameTimer)
           if (!cancelled) {
@@ -97,6 +104,7 @@ export default function VideoTile({ path, label, ready, onClick, large }: Props)
       cancelled = true
       abort.abort()
       window.clearTimeout(retryTimer)
+      window.clearTimeout(frameTimer)
       cleanupPlayers()
       video.onplaying = null
     }

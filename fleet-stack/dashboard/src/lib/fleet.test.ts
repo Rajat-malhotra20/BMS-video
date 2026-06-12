@@ -17,6 +17,9 @@ describe('busStatus', () => {
   it('CAMS_PER_BUS is 3', () => {
     expect(CAMS_PER_BUS).toBe(3)
   })
+  it('duplicate cams count as partial not online', () => {
+    expect(busStatus(bus('1', [1, 1, 1]))).toBe('partial')
+  })
 })
 
 describe('filterBuses', () => {

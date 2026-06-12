@@ -4,7 +4,7 @@ export const CAMS_PER_BUS = 3
 
 export function busStatus(bus: FleetBus): BusStatus {
   if (bus.cams.length === 0) return 'offline'
-  if (bus.cams.length >= CAMS_PER_BUS) return 'online'
+  if (new Set(bus.cams).size >= CAMS_PER_BUS) return 'online'
   return 'partial'
 }
 
