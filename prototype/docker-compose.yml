@@ -8,8 +8,10 @@ services:
       - "18889:8889" # WebRTC WHIP/WHEP
       - "19997:9997" # API
       - "18189:18189/udp"
+      - "19996:9996" # Playback (recordings)
     volumes:
       - ./mediamtx_conf/mediamtx.yml:/mediamtx.yml:ro
+      - ./recordings:/recordings
     restart: unless-stopped
 
   backend:

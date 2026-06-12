@@ -7,6 +7,8 @@ hlsAddress: :8888
 webrtcAddress: :8889      # WHIP ingest + WHEP playback
 apiAddress: :9997
 api: yes
+playback: yes
+playbackAddress: :9996
 
 protocols: [tcp, udp]
 readTimeout: 10s
@@ -38,11 +40,14 @@ authInternalUsers:
       - action: api        # allow /v3/paths/list (dashboard /cams discovery)
       - action: metrics
 
-paths:
-  # Accept any bus camera stream
-  ~^live/bus_:
-    source: publisher
-    record: no
+pathDefaults:
+  record: yes
+  recordPath: /recordings/%path/%Y-%m-%d_%H-%M-%S-%f
+  recordFormat: fmp4
+  recordPartDuration: 1s
+  recordSegmentDuration: 60s
+  recordDeleteAfter: 10m
 
-  all_others:
+paths:
+  all:
     source: publisher
