@@ -13,11 +13,12 @@ import (
 )
 
 type config struct {
-	addr         string
-	staticDir    string
-	mediaMTXHLS  string
-	mediaMTXWHEP string
-	mediaMTXAPI  string
+	addr              string
+	staticDir         string
+	mediaMTXHLS       string
+	mediaMTXWHEP      string
+	mediaMTXAPI       string
+	mediaMTXPlayback  string
 }
 
 func main() {
@@ -26,7 +27,8 @@ func main() {
 		staticDir:    env("STATIC_DIR", "./frontend"),
 		mediaMTXHLS:  env("MEDIAMTX_HLS_URL", "http://localhost:8888"),
 		mediaMTXWHEP: env("MEDIAMTX_WEBRTC_URL", "http://localhost:8889"),
-		mediaMTXAPI:  env("MEDIAMTX_API_URL", "http://localhost:9997/v3"),
+		mediaMTXAPI:      env("MEDIAMTX_API_URL", "http://localhost:9997/v3"),
+		mediaMTXPlayback: env("MEDIAMTX_PLAYBACK_URL", "http://localhost:9996"),
 	}
 
 	mux := http.NewServeMux()
@@ -39,6 +41,12 @@ func main() {
 	mux.Handle("/live/", reverseProxy(cfg.mediaMTXHLS, "", noCache))
 	mux.Handle("/whep/", reverseProxy(cfg.mediaMTXWHEP, "", nil))
 	mux.Handle("/mtx-api/", reverseProxy(cfg.mediaMTXAPI, "/mtx-api", nil))
+
+	api := newAPIServer(cfg.mediaMTXAPI)
+	mux.HandleFunc("GET /api/fleet", api.handleFleet)
+	mux.HandleFunc("GET /api/bus/{id}", api.handleBusDetail)
+	mux.Handle("/playback/", reverseProxy(cfg.mediaMTXPlayback, "/playback", noCache))
+
 	mux.Handle("/", staticSPA(cfg.staticDir))
 
 	server := &http.Server{
