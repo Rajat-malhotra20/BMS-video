@@ -1,0 +1,48 @@
+logLevel: info
+logDestinations: [stdout]
+
+rtspAddress: :8554
+rtmpAddress: :1935        # ← Larix RTMP ingest
+hlsAddress: :8888
+webrtcAddress: :8889      # WHIP ingest + WHEP playback
+apiAddress: :9997
+api: yes
+
+protocols: [tcp, udp]
+readTimeout: 10s
+writeTimeout: 10s
+webrtcICEServers2: []
+
+# WebRTC ICE: advertise reachable host(s) + fixed muxed UDP port so the
+# laptop browser can receive media from the Dockerised server.
+# Add your Windows LAN IP here too if viewing the dashboard from another device.
+webrtcAdditionalHosts: [127.0.0.1]
+webrtcLocalUDPAddress: :18189
+
+hlsAlwaysRemux: yes        # keep HLS segments flowing even with no active reader
+hlsVariant: mpegts         # broadest compatibility with hls.js
+hlsSegmentCount: 7
+hlsSegmentDuration: 1s
+hlsPartDuration: 200ms
+
+# Allow anonymous publish and read for dev
+authMethod: internal
+authInternalUsers:
+  - user: any
+    pass:
+    ips: []
+    permissions:
+      - action: publish
+      - action: read
+      - action: playback
+      - action: api        # allow /v3/paths/list (dashboard /cams discovery)
+      - action: metrics
+
+paths:
+  # Accept any bus camera stream
+  ~^live/bus_:
+    source: publisher
+    record: no
+
+  all_others:
+    source: publisher

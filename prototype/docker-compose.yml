@@ -1,0 +1,28 @@
+services:
+  mediamtx:
+    image: bluenviron/mediamtx:latest
+    ports:
+      - "11935:1935" # RTMP ingest
+      - "18554:8554" # RTSP
+      - "18888:8888" # HLS
+      - "18889:8889" # WebRTC WHIP/WHEP
+      - "19997:9997" # API
+      - "18189:18189/udp"
+    volumes:
+      - ./mediamtx_conf/mediamtx.yml:/mediamtx.yml:ro
+    restart: unless-stopped
+
+  backend:
+    build:
+      context: .
+      dockerfile: backend/Dockerfile
+    ports:
+      - "4000:8080"
+    environment:
+      MEDIAMTX_HLS_URL: http://mediamtx:8888
+      MEDIAMTX_WEBRTC_URL: http://mediamtx:8889
+      MEDIAMTX_API_URL: http://mediamtx:9997/v3
+      STATIC_DIR: /app/frontend
+    depends_on:
+      - mediamtx
+    restart: unless-stopped
