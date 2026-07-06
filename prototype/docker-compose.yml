@@ -16,8 +16,8 @@ services:
 
   backend:
     build:
-      context: .
-      dockerfile: backend/Dockerfile
+      context: ..
+      dockerfile: prototype/backend/Dockerfile
     ports:
       - "4000:8080"
     environment:
