@@ -4,7 +4,7 @@ This app should run on a public server when buses are on different internet conn
 
 ## Why Same WiFi Is Not Enough
 
-The local setup works only when the camera publisher and dashboard can reach the same machine directly. Real buses usually use mobile networks, and those networks are commonly behind NAT or CGNAT. That means your server cannot reliably connect inward to the bus.
+The local setup works only when the camera publisher and API server can reach the same machine directly. Real buses usually use mobile networks, and those networks are commonly behind NAT or CGNAT. That means your server cannot reliably connect inward to the bus.
 
 The reliable pattern is:
 
@@ -14,11 +14,11 @@ Bus camera / bus gateway
         |
         v
 Public VPS / cloud server
-  MediaMTX + Go backend + frontend
+  MediaMTX + Go API backend
         |
         v
-Dashboard users
-  open the web app
+Client apps
+  call the JSON API and play the returned stream URLs
 ```
 
 ## Current App Structure
@@ -30,22 +30,31 @@ prototype/
   docker-compose.yml
   backend/
     main.go
+    fleet.go
+    api.go
     Dockerfile
     go.mod
-  frontend/
-    index.html
   mediamtx_conf/
     mediamtx.yml
 ```
 
-The Go backend serves the frontend and proxies MediaMTX:
+The Go backend is a pure JSON API that proxies MediaMTX:
 
 ```text
-/live/     -> MediaMTX HLS      http://mediamtx:8888
-/whep/     -> MediaMTX WebRTC   http://mediamtx:8889
-/mtx-api/  -> MediaMTX API      http://mediamtx:9997/v3
-/health    -> Go backend health
+GET  /                              -> API service descriptor
+GET  /api/fleet                     -> all buses, live cam counts, status
+GET  /api/bus/{id}                  -> per-camera detail for one bus
+GET  /api/stream/{id}               -> live WHEP/HLS URLs for one bus's cams
+GET  /api/stream/{id}/recording     -> recording clip URL(s) for a time range
+GET  /health                        -> Go backend health
+
+/live/     -> MediaMTX HLS       http://mediamtx:8888
+/whep/     -> MediaMTX WebRTC    http://mediamtx:8889
+/playback/ -> MediaMTX playback  http://mediamtx:9996
+/mtx-api/  -> MediaMTX API       http://mediamtx:9997/v3
 ```
+
+Any external frontend (web, mobile, another service) calls these endpoints directly — the backend does not serve any UI itself.
 
 Inside Docker Compose, `backend` connects to `mediamtx` by service name:
 
@@ -53,7 +62,20 @@ Inside Docker Compose, `backend` connects to `mediamtx` by service name:
 MEDIAMTX_HLS_URL: http://mediamtx:8888
 MEDIAMTX_WEBRTC_URL: http://mediamtx:8889
 MEDIAMTX_API_URL: http://mediamtx:9997/v3
+MEDIAMTX_PLAYBACK_URL: http://mediamtx:9996
 ```
+
+## Bus and Camera ID Convention
+
+Bus IDs are alphanumeric strings (e.g. `DL1PC0001`), passed through as-is. Each camera on a bus publishes to a path named `<BUS_ID>_<camNo>`, camera numbers starting at 1:
+
+```text
+DL1PC0001_1
+DL1PC0001_2
+DL1PC0001_3
+```
+
+The backend discovers buses dynamically from whatever paths are currently publishing to MediaMTX — there is no separate static roster to maintain.
 
 ## How It Works For Remote Buses
 
@@ -65,18 +87,18 @@ Example public domain:
 stream.example.com
 ```
 
-Each bus publishes to the public server:
+Each bus camera publishes to the public server:
 
 ```text
-rtmp://stream.example.com:11935/live/bus_1
-rtmp://stream.example.com:11935/live/bus_2
-rtmp://stream.example.com:11935/live/bus_3
+rtmp://stream.example.com:11935/DL1PC0001_1
+rtmp://stream.example.com:11935/DL1PC0001_2
+rtmp://stream.example.com:11935/DL1PC0001_3
 ```
 
-The dashboard opens from:
+Client apps call the API from:
 
 ```text
-http://stream.example.com:4000
+http://stream.example.com:4000/api/fleet
 ```
 
 For production, put the Go backend behind HTTPS:
@@ -94,16 +116,17 @@ The current Compose file exposes:
 | Port | Protocol | Purpose |
 |---:|---|---|
 | `80` | TCP | HTTP, used by Caddy for Let's Encrypt |
-| `443` | TCP | HTTPS dashboard, production |
-| `4000` | TCP | Go backend + frontend |
+| `443` | TCP | HTTPS API access, production |
+| `4000` | TCP | Go backend (JSON API) |
 | `11935` | TCP | RTMP ingest from buses |
 | `18554` | TCP | RTSP, optional |
 | `18888` | TCP | MediaMTX HLS, optional direct access |
 | `18889` | TCP | MediaMTX WebRTC WHIP/WHEP, optional direct access |
-| `19997` | TCP | MediaMTX API, optional direct access |
 | `18189` | UDP | WebRTC media |
+| `19996` | TCP | MediaMTX playback (recordings), optional direct access |
+| `19997` | TCP | MediaMTX API, optional direct access |
 
-For production, avoid exposing `9997` publicly unless it is protected. The frontend only needs it through the Go backend proxy.
+For production, avoid exposing `9997` publicly unless it is protected. Client apps only need the Go backend's proxy routes.
 
 ## HTTPS With A Domain
 
@@ -124,10 +147,10 @@ DOMAIN=stream.example.com docker compose \
   up -d --build
 ```
 
-Open:
+Call the API at:
 
 ```text
-https://stream.example.com
+https://stream.example.com/api/fleet
 ```
 
 Caddy will automatically request and renew the certificate.
@@ -135,10 +158,8 @@ Caddy will automatically request and renew the certificate.
 For local LAN testing, keep using:
 
 ```text
-http://192.168.1.6:4000
+http://192.168.1.6:4000/api/fleet
 ```
-
-Local HTTPS on a phone needs a trusted certificate installed on the phone, so it is usually not worth using for quick LAN tests.
 
 ## Running Locally
 
@@ -148,28 +169,28 @@ From the repository root:
 docker compose -f prototype\docker-compose.yml up -d --build
 ```
 
-Open:
+Check the API:
 
 ```text
-http://localhost:4000
+http://localhost:4000/api/fleet
 ```
 
-Publish a test stream with a camera app such as Larix:
+Publish a test stream with a camera app such as Larix, or FFmpeg:
 
 ```text
-rtmp://<server-ip>:11935/live/bus_1
+rtmp://<server-ip>:11935/DL1PC0001_1
 ```
 
 For local testing on the same machine:
 
 ```text
-rtmp://localhost:11935/live/bus_1
+rtmp://localhost:11935/DL1PC0001_1
 ```
 
-Then play path:
+Then query it:
 
 ```text
-live/bus_1
+http://localhost:4000/api/bus/DL1PC0001
 ```
 
 ## Recommended Protocols
@@ -186,8 +207,18 @@ Use buses as publishers:
 Recommended production flow:
 
 ```text
-Bus publishes RTMP or SRT -> MediaMTX -> Dashboard plays HLS or WebRTC
+Bus publishes RTMP or SRT -> MediaMTX -> Client app plays HLS or WebRTC via the API's returned URLs
 ```
+
+## Recording Retention
+
+MediaMTX records every published camera to a rolling 1-hour buffer. Request a clip for any window inside that hour via:
+
+```text
+GET /api/stream/{busId}/recording?from=<RFC3339>&to=<RFC3339>
+```
+
+Requests for windows older than 1 hour will 404 when played, since the underlying segments have been deleted.
 
 ## Security Notes
 
@@ -197,9 +228,8 @@ Before exposing this server on the internet:
 
 1. Add authentication for publishing.
 2. Restrict or hide the MediaMTX API port.
-3. Use HTTPS for dashboard access.
-4. Use stable stream names such as `live/bus_001`.
-5. Keep firewall rules tight.
+3. Use HTTPS for API access.
+4. Keep firewall rules tight.
 
 Without authentication, anyone who can reach the server could publish or view streams.
 
@@ -222,13 +252,13 @@ Without authentication, anyone who can reach the server could publish or view st
 7. Configure bus camera apps to publish to:
 
    ```text
-   rtmp://stream.example.com:11935/live/<bus_id>
+   rtmp://stream.example.com:11935/<bus_id>_<cam_no>
    ```
 
-8. Open dashboard:
+8. Call the API:
 
    ```text
-   https://stream.example.com
+   https://stream.example.com/api/fleet
    ```
 
 ## Current Status
@@ -237,5 +267,5 @@ The current code is already wired for this pattern:
 
 - MediaMTX accepts incoming streams.
 - The Go backend connects to MediaMTX internally.
-- The frontend talks only to the Go backend.
+- The backend exposes a pure JSON API — no UI is bundled or served.
 - Remote buses need only outbound access to the public server ingest URL.
