@@ -105,6 +105,7 @@ func reverseProxy(target string, stripPrefix string, decorate func(http.Header))
 		if decorate != nil {
 			decorate(resp.Header)
 		}
+		rewriteProxyLocation(resp.Header, targetURL, stripPrefix)
 		return nil
 	}
 	proxy.ErrorHandler = func(w http.ResponseWriter, r *http.Request, err error) {
@@ -113,6 +114,39 @@ func reverseProxy(target string, stripPrefix string, decorate func(http.Header))
 	}
 
 	return proxy
+}
+
+func rewriteProxyLocation(header http.Header, targetURL *url.URL, stripPrefix string) {
+	if stripPrefix == "" {
+		return
+	}
+
+	location := header.Get("Location")
+	if location == "" {
+		return
+	}
+
+	if strings.HasPrefix(location, "/") {
+		if !strings.HasPrefix(location, stripPrefix+"/") && location != stripPrefix {
+			header.Set("Location", stripPrefix+location)
+		}
+		return
+	}
+
+	locationURL, err := url.Parse(location)
+	if err != nil || locationURL.Scheme == "" || locationURL.Host == "" {
+		return
+	}
+	if locationURL.Scheme != targetURL.Scheme || locationURL.Host != targetURL.Host {
+		return
+	}
+
+	locationURL.Scheme = ""
+	locationURL.Host = ""
+	if !strings.HasPrefix(locationURL.Path, stripPrefix+"/") && locationURL.Path != stripPrefix {
+		locationURL.Path = stripPrefix + locationURL.Path
+	}
+	header.Set("Location", locationURL.String())
 }
 
 func noCache(header http.Header) {
