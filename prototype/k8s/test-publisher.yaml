@@ -34,8 +34,12 @@ spec:
           imagePullPolicy: Always
           env:
             # Publish to the in-cluster ingest Service, not the NodePort.
+            # Must target the single real feed `livefeed`; MediaMTX fans it out
+            # on-demand to every `*_N` path (e.g. DL1TEST_1) via the regex path
+            # in mediamtx.yml. Do NOT publish directly to DL1TEST_1 — that path
+            # has a fixed source and rejects publishers.
             - name: RTMP_TARGET
-              value: "rtmp://bms-ingest:1935/DL1TEST_1"
+              value: "rtmp://bms-ingest:1935/livefeed"
           resources:
             requests:
               cpu: 100m
