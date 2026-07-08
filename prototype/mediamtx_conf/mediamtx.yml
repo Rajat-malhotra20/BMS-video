@@ -53,5 +53,10 @@ pathDefaults:
   recordDeleteAfter: 1h
 
 paths:
+  livefeed:
+    source: publisher
+  '~^.*_[0-9]+$':
+    source: rtmp://localhost:1935/livefeed
+    sourceOnDemand: yes
   all_others:
     source: publisher
