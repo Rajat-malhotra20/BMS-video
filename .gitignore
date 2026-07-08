@@ -4,3 +4,4 @@ dist/
 .DS_Store
 recordings/
 *.exe
+prototype/backend/mediamtx-console
