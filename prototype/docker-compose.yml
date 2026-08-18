@@ -7,11 +7,33 @@ services:
       - "${BACKEND_PORT:-4000}:8080"   # JSON API (the one API)
       - "11935:1935"                   # RTMP ingest
       - "18189:18189/udp"              # WebRTC media
+      - "8888:8888"                    # HLS playback (view)
+      - "8889:8889"                    # WebRTC signaling
+      - "9996:9996"                    # recording playback
+      - "9997:9997"                    # MediaMTX control API
+      - "9500:9500"                    # N9M device signaling
+      - "9501:9501"                    # N9M device media
     environment:
       MTX_WEBRTCADDITIONALHOSTS: "${MTX_WEBRTCADDITIONALHOSTS:-127.0.0.1}"
+      # supervisord sets no working directory for the backend program, so
+      # the app's relative "config/vendors.json" default wouldn't resolve
+      # inside the container — pin absolute paths matching the mount below.
+      VENDORS_CONFIG: "/config/vendors.json"
+      BUSES_CONFIG: "/config/buses.json"
+      # Vendor account passwords, if you'd rather not put them in
+      # backend/config/vendors.json (that file only needs baseUrl/username/
+      # extra then) — see backend/config/vendors.json.example.
+      # VENDOR_CASTMASTER_PASSWORD: ""
+      # VENDOR_SUMITHLIVE_PASSWORD: ""
+      # VENDOR_CHEMITOAPI_PASSWORD: ""
     volumes:
       - ./mediamtx_conf/mediamtx.yml:/mediamtx.yml:ro
       - ./recordings:/recordings
+      # vendors.json / buses.json (see backend/config/*.json.example) — the
+      # vendor-less POST /api/bridge/start has nothing to route without
+      # these. Missing files are fine (that endpoint just stays inert);
+      # the mount itself always works even if the directory is empty.
+      - ./backend/config:/config:ro
     restart: unless-stopped
     healthcheck:
       test: ["CMD", "wget", "-q", "-O-", "http://127.0.0.1:8080/health"]
@@ -19,18 +41,6 @@ services:
       timeout: 3s
       retries: 5
       start_period: 5s
-    logging:
-      driver: json-file
-      options:
-        max-size: "10m"
-        max-file: "3"
-
-  test-stream:
-    build:
-      context: ./test-stream
-    depends_on:
-      - app
-    restart: unless-stopped
     logging:
       driver: json-file
       options:

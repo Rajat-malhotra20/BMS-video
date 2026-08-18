@@ -1,6 +1,7 @@
 package main
 
 import (
+	"context"
 	"encoding/json"
 	"fmt"
 	"log"
@@ -10,12 +11,34 @@ import (
 	"strconv"
 	"sync"
 	"time"
+
+	"mediamtx-console/domain"
+	"mediamtx-console/services"
 )
 
 type apiServer struct {
 	mtxAPIBase string // e.g. http://mediamtx:9997/v3
 	tracker    *fleetTracker
 	client     *http.Client
+
+	// directKeys, if set, returns {bus}_{cam} keys currently live via a
+	// non-RTSP vendor result (embed or direct HLS) — never in MediaMTX, so
+	// they'd otherwise be invisible to GET /api/fleet. Wired in main.go
+	// once StreamService exists (apiServer is constructed first).
+	directKeys func() []services.DirectEntry
+
+	// vendorRoster, if set, sweeps every vendor account's own listing
+	// (e.g. Sumith's full vehicle list) so GET /api/fleet shows everything
+	// a vendor reports knowing about, not just buses someone has
+	// explicitly bridged or listed in config/buses.json.
+	vendorRoster func(ctx context.Context) []services.RosterEntry
+
+	// ensureStream, if set, is called by handleStreamLive when a
+	// specifically-requested ?cam= isn't already active: it starts the
+	// bridge on demand and returns the result, so the frontend never has
+	// to call POST /api/bridge/start itself. Returns (nil, nil) when the
+	// bus isn't configured for bridging at all.
+	ensureStream func(ctx context.Context, bus string, cam int) (*domain.StreamResult, error)
 
 	cacheMu     sync.Mutex
 	cachedFleet *fleetSummary
@@ -70,6 +93,104 @@ func (a *apiServer) fetchAllPaths() ([]mtxPath, error) {
 	return all, nil
 }
 
+// directPaths turns currently-active non-RTSP vendor sessions into
+// synthetic mtxPath entries (Ready=true, no tracks/bytes) so
+// fleetTracker.build can fold them into the fleet summary using the same
+// {bus}_{cam} parsing it already applies to real MediaMTX paths.
+// DirectKind carries which kind (embed/hls) so camDetail/streamInfo can
+// report it accurately instead of assuming "embed" for anything synthetic.
+func (a *apiServer) directPaths() []mtxPath {
+	if a.directKeys == nil {
+		return nil
+	}
+	entries := a.directKeys()
+	paths := make([]mtxPath, len(entries))
+	for i, e := range entries {
+		url := e.EmbedURL
+		if url == "" {
+			url = e.HLSURL
+		}
+		paths[i] = mtxPath{Name: e.Key, Ready: true, DirectKind: string(e.Kind), DirectURL: url}
+	}
+	return paths
+}
+
+// vendorRosterEntries is a.vendorRoster with a nil-safe check, so callers
+// don't each need to guard it separately.
+func (a *apiServer) vendorRosterEntries(ctx context.Context) []services.RosterEntry {
+	if a.vendorRoster == nil {
+		return nil
+	}
+	return a.vendorRoster(ctx)
+}
+
+// mergePaths de-dupes by Name, keeping the highest-priority source: real
+// MediaMTX ingest first, then an explicitly-started embed session — an
+// active session or real stream is always more authoritative than "the
+// vendor account reports knowing about this vehicle" (that's handled by
+// mergeRoster below, on the built summary, not here).
+func mergePaths(sources ...[]mtxPath) []mtxPath {
+	seen := make(map[string]bool)
+	var merged []mtxPath
+	for _, src := range sources {
+		for _, p := range src {
+			if seen[p.Name] {
+				continue
+			}
+			seen[p.Name] = true
+			merged = append(merged, p)
+		}
+	}
+	return merged
+}
+
+// mergeRoster adds every vendor-roster bus tracker.build didn't already
+// include, so a bus the vendor reports knowing about always shows up in
+// GET /api/fleet — even one that's never actually streamed and so would
+// otherwise never enter fleetTracker's seen-recently bookkeeping. Unlike
+// tracker.build's MediaMTX-sourced buses, these don't linger past their
+// vendor-reported state: absent from this call's roster means gone right
+// now, not a 10-minute grace window.
+//
+// Cams is always left empty here, deliberately: a roster entry's Online
+// signal (e.g. Sumith's GPS fix) confirms the *vehicle* is live, not that
+// a camera exists or works on it — confirmed live-tested that Sumith's
+// getLiveStreamingLink returns "success" for literally any channel_id
+// (0, 1, 4, 99, all identical), so it validates nothing about real
+// channel count. Only an actual started session (tracker.build's real
+// MediaMTX/embed-active signal, already merged into summary before this
+// runs) earns a slot in Cams/CamsOnline. BusesOnline still reflects the
+// roster signal, since "is this vehicle around" is a real answer even
+// when "does it have a working camera" isn't.
+func mergeRoster(summary fleetSummary, roster []services.RosterEntry) fleetSummary {
+	have := make(map[string]bool, len(summary.Buses))
+	for _, b := range summary.Buses {
+		have[b.ID] = true
+	}
+	for _, e := range roster {
+		busID, _, ok := parseBusPath(e.Key)
+		if !ok || have[busID] {
+			continue
+		}
+		have[busID] = true
+
+		if e.Online {
+			summary.Totals.BusesOnline++
+		}
+		summary.Totals.BusesSeen++
+		summary.Buses = append(summary.Buses, fleetBus{ID: busID, Label: e.Label, Cams: []int{}, LastSeen: time.Now().Unix()})
+	}
+	sort.Slice(summary.Buses, func(i, j int) bool {
+		a, errA := strconv.Atoi(summary.Buses[i].ID)
+		b, errB := strconv.Atoi(summary.Buses[j].ID)
+		if errA == nil && errB == nil {
+			return a < b
+		}
+		return summary.Buses[i].ID < summary.Buses[j].ID
+	})
+	return summary
+}
+
 // snapshot returns cached paths+summary, refreshing from MediaMTX when stale.
 // Issue 1: stampede-safe — lock is NOT held across HTTP fetches.
 func (a *apiServer) snapshot() (*fleetSummary, []mtxPath, error) {
@@ -106,7 +227,9 @@ func (a *apiServer) snapshot() (*fleetSummary, []mtxPath, error) {
 	paths, fetchErr := a.fetchAllPaths()
 	var summary fleetSummary
 	if fetchErr == nil {
+		paths = mergePaths(paths, a.directPaths())
 		summary = a.tracker.build(paths, time.Now())
+		summary = mergeRoster(summary, a.vendorRosterEntries(context.Background()))
 	}
 
 	// Write results back under the lock.
@@ -148,6 +271,8 @@ type camDetail struct {
 	Tracks        []string `json:"tracks"`
 	BytesReceived uint64   `json:"bytesReceived"`
 	Readers       int      `json:"readers"`
+	Kind          string   `json:"kind,omitempty"`      // "embed" or "hls" for a non-RTSP vendor bus; omitted for real MediaMTX ingest
+	DirectURL     string   `json:"directUrl,omitempty"` // the embed page or direct .m3u8 URL when Kind is set
 }
 
 type busDetail struct {
@@ -174,14 +299,19 @@ func (a *apiServer) handleBusDetail(w http.ResponseWriter, r *http.Request) {
 		if tracks == nil {
 			tracks = []string{}
 		}
-		detail.Cams = append(detail.Cams, camDetail{
+		cd := camDetail{
 			Cam:           cam,
 			Path:          p.Name,
 			Ready:         p.Ready,
 			Tracks:        tracks,
 			BytesReceived: p.BytesReceived,
 			Readers:       len(p.Readers),
-		})
+		}
+		if p.DirectKind != "" {
+			cd.Kind = p.DirectKind
+			cd.DirectURL = p.DirectURL
+		}
+		detail.Cams = append(detail.Cams, cd)
 	}
 	writeJSON(w, detail)
 }
@@ -205,11 +335,13 @@ func camsForBus(paths []mtxPath, busID string) []mtxPath {
 }
 
 type streamInfo struct {
-	Cam     int    `json:"cam"`
-	Path    string `json:"path"`
-	Ready   bool   `json:"ready"`
-	WhepURL string `json:"whepUrl"`
-	HLSURL  string `json:"hlsUrl"`
+	Cam       int    `json:"cam"`
+	Path      string `json:"path"`
+	Ready     bool   `json:"ready"`
+	Kind      string `json:"kind,omitempty"`      // "embed" or "hls" — no MediaMTX ingest; DirectURL below carries the vendor's own link
+	WhepURL   string `json:"whepUrl,omitempty"`   // our MediaMTX proxy path — only set for real ingest (Kind empty)
+	HLSURL    string `json:"hlsUrl,omitempty"`    // our MediaMTX proxy path — only set for real ingest (Kind empty)
+	DirectURL string `json:"directUrl,omitempty"` // the vendor's embed page or direct .m3u8 URL — only set when Kind is set
 }
 
 func (a *apiServer) handleStreamLive(w http.ResponseWriter, r *http.Request) {
@@ -232,15 +364,81 @@ func (a *apiServer) handleStreamLive(w http.ResponseWriter, r *http.Request) {
 				continue
 			}
 		}
-		result = append(result, streamInfo{
-			Cam:     cam,
-			Path:    p.Name,
-			Ready:   p.Ready,
-			WhepURL: "/whep/" + p.Name + "/whep",
-			HLSURL:  "/live/" + p.Name + "/index.m3u8",
-		})
+		si := streamInfo{Cam: cam, Path: p.Name, Ready: p.Ready}
+		if p.DirectKind != "" {
+			si.Kind = p.DirectKind
+			si.DirectURL = p.DirectURL
+		} else {
+			si.WhepURL = "/whep/" + p.Name + "/whep"
+			si.HLSURL = "/live/" + p.Name + "/index.m3u8"
+		}
+		result = append(result, si)
 	}
+
+	// Nothing found for the specific cam asked for — either it's already
+	// active but started too recently for the (2s) fleet cache to show it
+	// yet, or it's genuinely not started. Check directKeys fresh (it's an
+	// in-memory read, not another vendor round trip) before deciding to
+	// trigger a start — otherwise a session started a moment ago would
+	// look like a no-op to ensureStream (correctly, it IS already active)
+	// but never get reported back here.
+	if len(result) == 0 && camFilter != "" {
+		if wantCam, err := strconv.Atoi(camFilter); err == nil {
+			key := id + "_" + strconv.Itoa(wantCam)
+
+			if a.directKeys != nil {
+				for _, e := range a.directKeys() {
+					if e.Key == key {
+						result = append(result, directEntryToInfo(e, wantCam))
+						break
+					}
+				}
+			}
+
+			if len(result) == 0 && a.ensureStream != nil {
+				started, err := a.ensureStream(r.Context(), id, wantCam)
+				if err != nil {
+					http.Error(w, err.Error(), http.StatusBadGateway)
+					return
+				}
+				if started != nil {
+					result = append(result, streamResultToInfo(*started, wantCam))
+				}
+			}
+		}
+	}
+
 	writeJSON(w, result)
+}
+
+// streamResultToInfo renders a just-started domain.StreamResult in the
+// same shape handleStreamLive already uses for a cache-discovered entry.
+func streamResultToInfo(r domain.StreamResult, cam int) streamInfo {
+	si := streamInfo{Cam: cam, Path: r.Key, Ready: true}
+	switch r.Kind {
+	case domain.KindEmbed:
+		si.Kind = "embed"
+		si.DirectURL = r.EmbedURL
+	case domain.KindHLS:
+		si.Kind = "hls"
+		si.DirectURL = r.HLSURL
+	default:
+		si.WhepURL = "/whep/" + r.Key + "/whep"
+		si.HLSURL = "/live/" + r.Key + "/index.m3u8"
+	}
+	return si
+}
+
+// directEntryToInfo renders an already-active services.DirectEntry (found
+// via a.directKeys, bypassing a possibly-stale fleet cache) the same way.
+func directEntryToInfo(e services.DirectEntry, cam int) streamInfo {
+	si := streamInfo{Cam: cam, Path: e.Key, Ready: true, Kind: string(e.Kind)}
+	if e.Kind == domain.KindEmbed {
+		si.DirectURL = e.EmbedURL
+	} else {
+		si.DirectURL = e.HLSURL
+	}
+	return si
 }
 
 type recordingInfo struct {

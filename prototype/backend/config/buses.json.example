@@ -1,0 +1,14 @@
+{
+  "DL1PC0001": {
+    "vendor": "castmaster",
+    "vendorParams": { "terid": "AE99873120" }
+  },
+  "DL1PC0002": {
+    "vendor": "n9m",
+    "vendorParams": { "dsno": "00600052B8" }
+  },
+  "DL1PC0003": {
+    "vendor": "sumithlive",
+    "vendorParams": { "plateNo": "GJ03BZ0211", "projectId": "37" }
+  }
+}

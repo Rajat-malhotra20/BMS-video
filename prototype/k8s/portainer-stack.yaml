@@ -75,6 +75,38 @@ data:
         source: publisher
 
 ---
+# Vendor-less bridge config (see prototype/backend/config/*.json.example).
+# vendors.json's passwords are deliberately left empty here — they come
+# from the vendor-credentials Secret below instead, via VENDOR_<NAME>_
+# PASSWORD env vars (config/vendors.go fills a blank password from that
+# env var). Edit buses.json here to add/reassign a bus; no image rebuild
+# needed, just `kubectl apply` + a rollout restart (mounted config, same
+# as mediamtx.yml below).
+apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: vendors-config
+  namespace: bms-dev
+data:
+  vendors.json: |
+    {
+      "castmaster": { "baseUrl": "https://cmmipl.org:22056", "username": "admin", "password": "" },
+      "sumithlive": { "baseUrl": "https://trakzee2.uffizio.com", "username": "", "password": "", "extra": { "projectId": "" } },
+      "chemitoapi": { "baseUrl": "http://15.252.130.159:12056", "username": "admin", "password": "" }
+    }
+  buses.json: |
+    {}
+
+---
+# vendor-credentials Secret (passwords) is NOT defined here on purpose —
+# same reasoning as the ecr-pull secret below: a real-value Secret must
+# never live in a file that gets `kubectl apply`'d repeatedly, or the next
+# apply resets it to whatever placeholder is committed. Create it once,
+# out-of-band, before applying this file — see DEPLOY.md. All three keys
+# must exist (even as empty strings) or the Deployment's secretKeyRef
+# below fails to start the pod.
+
+---
 apiVersion: v1
 kind: PersistentVolumeClaim
 metadata:
@@ -126,6 +158,36 @@ spec:
             # WebRTC ICE candidates advertise an unreachable port.
             - name: MTX_WEBRTCLOCALUDPADDRESS
               value: ":30189"
+            # CORS for the JSON API. "*" is a placeholder — pin this to the
+            # real frontend origin before this is reachable from production.
+            - name: CORS_ALLOWED_ORIGIN
+              value: "*"
+            # supervisord sets no working directory for the backend program,
+            # so the relative "config/vendors.json" default wouldn't resolve
+            # — pin absolute paths matching the vendor-config volume below.
+            - name: VENDORS_CONFIG
+              value: "/config/vendors.json"
+            - name: BUSES_CONFIG
+              value: "/config/buses.json"
+            # Passwords only — the rest of each vendor's config comes from
+            # the vendors-config ConfigMap (mounted below); this fills in
+            # the blank "password" field config/vendors.go leaves for env
+            # override. See the vendor-credentials Secret note above.
+            - name: VENDOR_CASTMASTER_PASSWORD
+              valueFrom:
+                secretKeyRef:
+                  name: vendor-credentials
+                  key: castmaster-password
+            - name: VENDOR_SUMITHLIVE_PASSWORD
+              valueFrom:
+                secretKeyRef:
+                  name: vendor-credentials
+                  key: sumithlive-password
+            - name: VENDOR_CHEMITOAPI_PASSWORD
+              valueFrom:
+                secretKeyRef:
+                  name: vendor-credentials
+                  key: chemitoapi-password
           ports:
             - containerPort: 8080
               protocol: TCP   # Go JSON API (the one API)
@@ -133,10 +195,16 @@ spec:
               protocol: TCP   # RTMP ingest
             - containerPort: 30189
               protocol: UDP   # WebRTC media
+            - containerPort: 9500
+              protocol: TCP   # N9M device signaling
+            - containerPort: 9501
+              protocol: TCP   # N9M device media
           volumeMounts:
             - name: config
               mountPath: /mediamtx.yml
               subPath: mediamtx.yml
+            - name: vendor-config
+              mountPath: /config
             - name: recordings
               mountPath: /recordings
           readinessProbe:
@@ -168,6 +236,9 @@ spec:
         - name: config
           configMap:
             name: mediamtx-config
+        - name: vendor-config
+          configMap:
+            name: vendors-config
         - name: recordings
           persistentVolumeClaim:
             claimName: recordings-pvc
@@ -211,3 +282,13 @@ spec:
       targetPort: 30189
       nodePort: 30189   # must equal MTX_WEBRTCLOCALUDPADDRESS port — do not remap
       protocol: UDP
+    - name: n9m-signal
+      port: 9500
+      targetPort: 9500
+      nodePort: 30500
+      protocol: TCP
+    - name: n9m-media
+      port: 9501
+      targetPort: 9501
+      nodePort: 30501
+      protocol: TCP

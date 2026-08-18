@@ -1,0 +1,5 @@
+# streamKey,inputUrl
+# One line per camera. streamKey must be unique across your whole fleet
+# (it becomes the path segment on our RTMP server) — e.g. "<bus>_<cam>".
+bus123_cam1,rtsp://127.0.0.1:8554/cam1
+bus123_cam2,rtsp://127.0.0.1:8554/cam2

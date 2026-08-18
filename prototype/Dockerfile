@@ -6,9 +6,8 @@
 # ---- build Go backend ----
 FROM golang:1.22-alpine AS build
 WORKDIR /src
-COPY backend/go.mod ./
-COPY backend/*.go ./
-RUN CGO_ENABLED=0 go build -trimpath -ldflags="-s -w" -o /out/mediamtx-console
+COPY backend/ ./
+RUN CGO_ENABLED=0 go build -trimpath -ldflags="-s -w" -o /out/mediamtx-console .
 
 # ---- pull the MediaMTX binary from its official image ----
 FROM bluenviron/mediamtx:1.19.2 AS mtx
@@ -17,9 +16,9 @@ FROM bluenviron/mediamtx:1.19.2 AS mtx
 FROM alpine:3.20
 # Numeric UID/GID (10001) so Kubernetes runAsNonRoot can verify the user is
 # non-root — a named user (USER app) fails that check.
-RUN apk add --no-cache ca-certificates supervisor wget \
+RUN apk add --no-cache ca-certificates supervisor wget ffmpeg \
     && addgroup -S -g 10001 app && adduser -S -u 10001 -G app app \
-    && mkdir -p /recordings && chown 10001:10001 /recordings
+    && mkdir -p /recordings /config && chown 10001:10001 /recordings /config
 COPY --from=mtx /mediamtx /usr/local/bin/mediamtx
 COPY --from=build /out/mediamtx-console /usr/local/bin/mediamtx-console
 COPY mediamtx_conf/mediamtx.yml /mediamtx.yml

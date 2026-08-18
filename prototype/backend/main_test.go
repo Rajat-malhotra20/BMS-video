@@ -50,4 +50,3 @@ func TestRewriteProxyLocation_AbsoluteUpstreamURL(t *testing.T) {
 		t.Fatalf("Location = %q, want %q", got, want)
 	}
 }
-

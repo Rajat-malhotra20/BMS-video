@@ -17,12 +17,21 @@ type mtxPath struct {
 	Readers       []struct {
 		Type string `json:"type"`
 	} `json:"readers"`
+
+	// DirectKind/DirectURL are set on a synthetic entry from
+	// apiServer.directPaths — a bus live via a non-RTSP vendor result
+	// ("embed" or "hls"), no MediaMTX ingest at all. Empty for a real
+	// MediaMTX path; never set by MediaMTX itself, JSON-ignored since
+	// neither ever appears in the real /paths/list response.
+	DirectKind string `json:"-"`
+	DirectURL  string `json:"-"`
 }
 
 type fleetBus struct {
 	ID       string `json:"id"`
-	Cams     []int  `json:"cams"`     // camera numbers currently live
-	LastSeen int64  `json:"lastSeen"` // unix seconds any cam was last live
+	Label    string `json:"label,omitempty"` // human-readable name (plate, car licence, ...) from a vendor roster — omitted when the id is already the readable name
+	Cams     []int  `json:"cams"`            // camera numbers currently live
+	LastSeen int64  `json:"lastSeen"`        // unix seconds any cam was last live
 }
 
 type fleetTotals struct {

@@ -5,3 +5,5 @@ dist/
 recordings/
 *.exe
 prototype/backend/mediamtx-console
+prototype/backend/config/vendors.json
+prototype/backend/config/buses.json

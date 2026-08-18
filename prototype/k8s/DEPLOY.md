@@ -1,11 +1,17 @@
 # Deploy / Redeploy Runbook — bms-dev
 
 Single container (MediaMTX + Go API via supervisord). Single node.
-Image is loaded onto the node manually and the Deployment uses
-`imagePullPolicy: Never`, so the cluster never pulls from ECR — no pull
-secret, no `aws` CLI on the node needed.
+The Deployment uses `imagePullPolicy: Always` and pulls from ECR — the
+cluster needs registry auth, either a Portainer ECR registry (auto-
+refreshes the token) or the `ecr-pull` secret (manual ~12h refresh,
+created out-of-band, not in `portainer-stack.yaml`).
 
 Image: `475560691356.dkr.ecr.ap-south-1.amazonaws.com/bms/video/dev:latest`
+
+The manual save/copy/load steps below are an **alternative** for a node
+with no registry access at all — if you use them, also flip
+`imagePullPolicy` to `Never` and drop `imagePullSecrets` in the Deployment,
+or the pod will just try (and fail) to pull from ECR anyway.
 
 ---
 
@@ -88,12 +94,45 @@ kubectl -n bms-dev rollout status deploy/bms-video
 
 ---
 
-## Config change only (mediamtx.yml)
+## Config change only (mediamtx.yml, vendors.json, buses.json)
 
-Edit the ConfigMap block in `portainer-stack.yaml`, then:
+Edit the relevant ConfigMap block in `portainer-stack.yaml`
+(`mediamtx-config` or `vendors-config`), then:
 ```bash
 kubectl apply -f portainer-stack.yaml
 kubectl -n bms-dev rollout restart deploy/bms-video   # mounted config needs a pod restart
+```
+
+---
+
+## First-time setup: vendor bridge credentials
+
+`POST /api/bridge/start` (the vendor-less bridge — see `HOW_TO_USE.md` §6)
+needs vendor account passwords, which — same reasoning as `ecr-pull` —
+must never live in a file this stack `kubectl apply`'s repeatedly. Create
+the Secret once, out-of-band, **before** the first `kubectl apply`:
+
+```bash
+kubectl -n bms-dev create secret generic vendor-credentials \
+  --from-literal=castmaster-password='...' \
+  --from-literal=sumithlive-password='...' \
+  --from-literal=chemitoapi-password='...'
+```
+
+All three keys must exist (blank string is fine for any vendor you're not
+using) — the Deployment's `secretKeyRef`s fail the pod otherwise. Non-secret
+fields (`baseUrl`, `username`, `extra`) and the bus→vendor map live in the
+`vendors-config` ConfigMap in `portainer-stack.yaml` instead — edit that
+file directly for those (see the "Config change only" section above).
+
+To rotate a password later:
+```bash
+kubectl -n bms-dev create secret generic vendor-credentials \
+  --from-literal=castmaster-password='NEW' \
+  --from-literal=sumithlive-password='...' \
+  --from-literal=chemitoapi-password='...' \
+  --dry-run=client -o yaml | kubectl apply -f -
+kubectl -n bms-dev rollout restart deploy/bms-video
 ```
 
 ---
@@ -105,10 +144,13 @@ kubectl -n bms-dev rollout restart deploy/bms-video   # mounted config needs a p
 | JSON API (the one API) | `http://<node-ip>:30080/api/fleet` |
 | RTMP publish (buses) | `rtmp://<node-ip>:31935/<bus_id>_<cam_no>` |
 | WebRTC media | UDP `30189` on `bms-media.gna.energy` |
+| N9M device signaling | `<node-ip>:30500` (device config points here) |
+| N9M device media | `<node-ip>:30501` |
 
-Node security group / firewall must allow inbound: `30080/TCP`, `31935/TCP`, `30189/UDP`.
+Node security group / firewall must allow inbound: `30080/TCP`, `31935/TCP`, `30189/UDP`, `30500/TCP`, `30501/TCP`.
 
 ## Preconditions to check once
 - `kubectl get storageclass` — a default StorageClass must exist, else `recordings-pvc` stays Pending.
 - DNS `A` record `bms-media.gna.energy` → node public IP (WebRTC ICE advertises this host).
-- If pod shows `ErrImageNeverPull`: image name on the node ≠ manifest name, or it landed in the wrong containerd namespace (must be `k8s.io`). Recheck step 3.
+- `vendor-credentials` Secret exists (see "First-time setup" above) — without it the pod won't start at all (missing `secretKeyRef`).
+- If pod shows `ErrImageNeverPull`: only applies if you switched to the manual-load path above; otherwise check `ecr-pull` / registry auth instead.

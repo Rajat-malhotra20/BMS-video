@@ -3,12 +3,22 @@ package main
 import (
 	"errors"
 	"log"
+	"net"
 	"net/http"
 	"net/http/httputil"
 	"net/url"
 	"os"
 	"strings"
 	"time"
+
+	vendorconfig "mediamtx-console/config"
+	"mediamtx-console/services"
+	"mediamtx-console/vendorclients/n9mserver"
+	"mediamtx-console/vendors"
+	castmasteradapter "mediamtx-console/vendors/castmaster"
+	chemitoapiadapter "mediamtx-console/vendors/chemitoapi"
+	n9madapter "mediamtx-console/vendors/n9m"
+	sumithliveadapter "mediamtx-console/vendors/sumithlive"
 )
 
 type config struct {
@@ -17,6 +27,12 @@ type config struct {
 	mediaMTXWHEP     string
 	mediaMTXAPI      string
 	mediaMTXPlayback string
+	mediaMTXRTSP     string
+	n9mSignalAddr    string
+	n9mMediaAddr     string
+	corsOrigin       string
+	vendorsConfig    string
+	busesConfig      string
 }
 
 func main() {
@@ -26,6 +42,37 @@ func main() {
 		mediaMTXWHEP:     env("MEDIAMTX_WEBRTC_URL", "http://localhost:8889"),
 		mediaMTXAPI:      env("MEDIAMTX_API_URL", "http://localhost:9997/v3"),
 		mediaMTXPlayback: env("MEDIAMTX_PLAYBACK_URL", "http://localhost:9996"),
+		mediaMTXRTSP:     env("MEDIAMTX_RTSP_PUBLISH_URL", "rtsp://localhost:8554"),
+		n9mSignalAddr:    env("N9M_SIGNAL_ADDR", ":9500"),
+		n9mMediaAddr:     env("N9M_MEDIA_ADDR", ":9501"),
+		corsOrigin:       env("CORS_ALLOWED_ORIGIN", "*"),
+		vendorsConfig:    env("VENDORS_CONFIG", "config/vendors.json"),
+		busesConfig:      env("BUSES_CONFIG", "config/buses.json"),
+	}
+
+	// n9mSrv is the Chemito/N9M device server: accepts OBU signaling +
+	// media connections on two ports (see n9mSignalAddr/n9mMediaAddr
+	// below).
+	n9mSrv := n9mserver.NewServer(log.Default())
+	if ln, err := net.Listen("tcp", cfg.n9mSignalAddr); err != nil {
+		log.Printf("n9m: signaling listener disabled: %v", err)
+	} else {
+		log.Printf("n9m signaling listening on %s", cfg.n9mSignalAddr)
+		go func() {
+			if err := n9mSrv.ServeSignaling(ln); err != nil {
+				log.Printf("n9m: signaling listener stopped: %v", err)
+			}
+		}()
+	}
+	if ln, err := net.Listen("tcp", cfg.n9mMediaAddr); err != nil {
+		log.Printf("n9m: media listener disabled: %v", err)
+	} else {
+		log.Printf("n9m media listening on %s", cfg.n9mMediaAddr)
+		go func() {
+			if err := n9mSrv.ServeMedia(ln); err != nil {
+				log.Printf("n9m: media listener stopped: %v", err)
+			}
+		}()
 	}
 
 	mux := http.NewServeMux()
@@ -46,7 +93,84 @@ func main() {
 	mux.HandleFunc("GET /api/stream/{id}/recording", api.handleStreamRecording)
 	mux.Handle("/playback/", reverseProxy(cfg.mediaMTXPlayback, "/playback", noCache))
 
+	brs := newBridgeServer(cfg.mediaMTXRTSP, n9mSrv)
+
+	// Vendor-less bridge API: the frontend just says "start bus X cam Y"
+	// (see config.Bus) and never names a vendor. Missing config files mean
+	// no buses are bridgeable this way yet — everything else keeps working.
+	vendorAccounts, err := vendorconfig.LoadVendors(cfg.vendorsConfig)
+	if err != nil {
+		log.Printf("bridge: %v (unified /api/bridge/start has no buses configured)", err)
+		vendorAccounts = map[string]vendorconfig.VendorAccount{}
+	}
+	buses, err := vendorconfig.LoadBuses(cfg.busesConfig)
+	if err != nil {
+		log.Printf("bridge: %v (unified /api/bridge/start has no buses configured)", err)
+		buses = map[string]vendorconfig.Bus{}
+	}
+	castmasterAcct := vendorAccounts["castmaster"]
+	sumithliveAcct := vendorAccounts["sumithlive"]
+	chemitoapiAcct := vendorAccounts["chemitoapi"]
+	registry := vendors.NewRegistry(
+		castmasteradapter.New(castmasteradapter.Config{
+			BaseURL:  castmasterAcct.BaseURL,
+			Username: castmasterAcct.Username,
+			Password: castmasterAcct.Password,
+		}),
+		sumithliveadapter.New(sumithliveadapter.Config{
+			BaseURL:          sumithliveAcct.BaseURL,
+			Username:         sumithliveAcct.Username,
+			Password:         sumithliveAcct.Password,
+			DefaultProjectID: sumithliveAcct.Extra["projectId"],
+		}),
+		chemitoapiadapter.New(chemitoapiadapter.Config{
+			BaseURL:  chemitoapiAcct.BaseURL,
+			Username: chemitoapiAcct.Username,
+			Password: chemitoapiAcct.Password,
+		}),
+		n9madapter.New(n9mSrv),
+	)
+	streamSvc := &services.StreamService{
+		Registry:       registry,
+		Supervisor:     brs.supervisor,
+		RTSPPublish:    cfg.mediaMTXRTSP,
+		RestartBackoff: brs.restartBackoff,
+	}
+	ubrs := newUnifiedBridgeServer(streamSvc, buses)
+
+	// So GET /api/fleet (and /api/bus/{id}, /api/stream/{id}) also see
+	// buses live via an embed-kind vendor, which never touch MediaMTX —
+	// both ones someone has explicitly started (directKeys) and everything
+	// a vendor account reports knowing about (vendorRoster).
+	api.directKeys = streamSvc.ActiveDirectKeys
+	api.vendorRoster = streamSvc.VendorRoster
+
+	// GET /api/stream/{id}?cam=N starts the bridge on demand if it isn't
+	// already active — the frontend never has to call
+	// POST /api/bridge/start itself; that endpoint is internal now (kept
+	// below for admin/debug and as what this hook calls under the hood).
+	api.ensureStream = ubrs.ensureStream
+
+	mux.HandleFunc("POST /api/bridge/start", ubrs.handleStart)
+	mux.HandleFunc("POST /api/bridge/stop", ubrs.handleStop)
+	mux.HandleFunc("GET /api/bridge", ubrs.handleList)
+
+	// Admin/debug only — direct per-vendor calls. Not for frontend use, so
+	// they're kept off the "/" endpoint listing; still routed for
+	// debugging one vendor in isolation and for looking up device ids
+	// (e.g. GET /api/bridge/n9m/devices) to put into config/buses.json.
+	// Jobs started this way still show up in GET /api/bridge and stop via
+	// POST /api/bridge/stop above — same underlying Supervisor.
+	mux.HandleFunc("POST /api/bridge/castmaster/start", brs.handleCastmasterStart)
+	mux.HandleFunc("POST /api/bridge/n9m/start", brs.handleN9mStart)
+	mux.HandleFunc("POST /api/bridge/sumithlive/start", brs.handleSumithLiveStart)
+	mux.HandleFunc("GET /api/bridge/sumithlive/vehicles", brs.handleSumithLiveVehicles)
+	mux.HandleFunc("GET /api/bridge/n9m/devices", brs.handleN9mDevices)
+
 	mux.HandleFunc("/", func(w http.ResponseWriter, _ *http.Request) {
+		// Frontend-facing only. The per-vendor /api/bridge/{castmaster,n9m,
+		// sumithlive}/... routes above still work but are admin/debug —
+		// left off this listing on purpose.
 		writeJSON(w, map[string]any{
 			"service": "fleet-bms-api",
 			"endpoints": []string{
@@ -54,6 +178,8 @@ func main() {
 				"GET /api/bus/{id}",
 				"GET /api/stream/{id}",
 				"GET /api/stream/{id}/recording?from=&to=",
+				"POST /api/bridge/stop?key=",
+				"GET /api/bridge",
 				"GET /health",
 			},
 		})
@@ -61,7 +187,7 @@ func main() {
 
 	server := &http.Server{
 		Addr:              cfg.addr,
-		Handler:           logRequests(mux),
+		Handler:           cors(cfg.corsOrigin)(logRequests(mux)),
 		ReadHeaderTimeout: 5 * time.Second,
 	}
 
@@ -165,6 +291,27 @@ func singleJoiningSlash(base, next string) string {
 		return base + "/" + next
 	default:
 		return base + next
+	}
+}
+
+// cors allows a browser-hosted frontend on a different origin to call this
+// API directly (fetch to /api/*, plus the proxied /live, /whep, /playback
+// paths). allowedOrigin is a single origin (or "*") from CORS_ALLOWED_ORIGIN;
+// "*" is fine for local dev but should be pinned to the real frontend origin
+// in production.
+func cors(allowedOrigin string) func(http.Handler) http.Handler {
+	return func(next http.Handler) http.Handler {
+		return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+			w.Header().Set("Access-Control-Allow-Origin", allowedOrigin)
+			w.Header().Set("Vary", "Origin")
+			w.Header().Set("Access-Control-Allow-Methods", "GET, POST, OPTIONS")
+			w.Header().Set("Access-Control-Allow-Headers", "Content-Type, Authorization")
+			if r.Method == http.MethodOptions {
+				w.WriteHeader(http.StatusNoContent)
+				return
+			}
+			next.ServeHTTP(w, r)
+		})
 	}
 }
 
