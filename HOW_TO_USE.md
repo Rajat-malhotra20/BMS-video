@@ -1,57 +1,11 @@
-# How To Use — Fleet BMS API
+# How To Use — Fleet BMS API (Frontend)
 
-This project lets bus cameras stream video to a server, and gives any app a
-simple API to list buses, watch live video, and pull recent recordings.
+This is a pure JSON API. All requests go to `http://<server-ip>:4000`
+(or `https://bms-media.gna.energy` in production).
 
-No frontend is included — this is a pure JSON API. Build your own UI (web,
-mobile, whatever) that calls it.
+There are exactly **4 endpoints** a frontend needs.
 
-## 1. Start the server
-
-```powershell
-cd prototype
-docker compose up -d --build
-```
-
-This starts two things:
-- **MediaMTX** — receives camera video, records it, plays it back
-- **Go backend** — the JSON API your app will talk to, on `http://localhost:4000`
-
-Check it's running:
-
-```powershell
-curl http://localhost:4000/health
-```
-
-Should print `ok`.
-
-## 2. Point cameras at the server
-
-Each camera on a bus streams to a URL shaped like this:
-
-```
-rtmp://<server-ip>:11935/<BUS_ID>_<CAMERA_NUMBER>
-```
-
-- `BUS_ID` — the bus's ID, e.g. `DL1PC0001`. Use it exactly as-is.
-- `CAMERA_NUMBER` — `1`, `2`, or `3` for that bus's cameras.
-
-Example, bus `DL1PC0001` with 3 cameras:
-
-```
-rtmp://<server-ip>:11935/DL1PC0001_1
-rtmp://<server-ip>:11935/DL1PC0001_2
-rtmp://<server-ip>:11935/DL1PC0001_3
-```
-
-Any camera app that can push RTMP (or SRT/WHIP) works — no setup needed on
-the server side, it just starts showing up once a camera connects.
-
-## 3. Use the API
-
-All requests go to `http://<server-ip>:4000`.
-
-### See every bus and how many cameras are live
+## 1. List every bus
 
 ```
 GET /api/fleet
@@ -67,31 +21,49 @@ GET /api/fleet
 }
 ```
 
-`cams` lists which camera numbers are currently live. An empty list means
-that bus was seen recently but isn't streaming right now.
+- `cams` lists which camera numbers are currently live. An empty list means
+  that bus was seen recently but isn't streaming right now.
+- Calling this also nudges the server to discover and start any bus/cam
+  that isn't live yet — polling `/api/fleet` regularly (e.g. every 10-20s)
+  is what keeps the fleet view filling in on its own, not just a status
+  read. No need to poll faster than every ~20s; it's throttled anyway.
 
-### See detail for one bus
+## 2. Get detail for one bus
 
 ```
 GET /api/bus/DL1PC0001
 ```
 
-Returns bitrate, codec, and viewer count for each of that bus's cameras.
+```json
+{
+  "id": "DL1PC0001",
+  "cams": [
+    { "cam": 1, "path": "DL1PC0001_1", "ready": true, "tracks": ["H264"],
+      "bytesReceived": 2820466, "readers": 0 }
+  ]
+}
+```
 
-### Get a playable video link for a bus
+Bitrate/codec info (`tracks`, `bytesReceived`) and viewer count (`readers`)
+per camera. Some cameras may instead show `"kind": "hls"` or
+`"kind": "embed"` with a `"directUrl"` — see endpoint 3 for what that means.
+
+## 3. Get a playable video link for one camera
 
 ```
 GET /api/stream/DL1PC0001?cam=1
 ```
 
-If that bus/cam isn't already live, this call starts it on demand (vendor
-login + resolve happens right here) — the frontend never has to call
-`POST /api/bridge/start` itself. First call after a bus has been idle can
-take a few seconds while the stream connects; poll again if `ready` isn't
-`true` yet.
+**Always pass `?cam=N`.** Calling this without it only reports
+already-active sessions and starts nothing — it'll return `[]` for a bus
+nobody has watched yet, even if that bus is really online.
 
-Response shape depends on how that camera is actually delivered — check
-`kind` (or whether `kind` is present at all) to decide how to play it:
+If that cam isn't already live, this starts it on demand — first call
+after the bus has been idle can take a few seconds while it connects;
+poll again if `ready` isn't `true` yet.
+
+Response shape depends on how that camera is delivered — check for a
+`kind` field to decide how to play it:
 
 ```json
 [
@@ -108,21 +80,16 @@ Response shape depends on how that camera is actually delivered — check
 ]
 ```
 
-- No `kind` field → a normal remuxed RTSP camera (direct push, Castmaster,
-  Chemito, N9M). Use `whepUrl` first (low-latency WebRTC), `hlsUrl` as a
-  ~2-5s-delay fallback that works everywhere.
-- `kind: "hls"` → play `directUrl` straight in a `<video>` tag with
-  [hls.js](https://github.com/video-dev/hls.js) — it's the vendor's own CDN
-  URL, not proxied through this server.
-- `kind: "embed"` → `directUrl` is a page, not a media URL; load it in an
-  `<iframe>` instead (`GET /api/bus/{id}` also reports this shape per cam).
+- **No `kind` field** → a normal camera relayed through this server. Use
+  `whepUrl` first (low-latency WebRTC). Fall back to `hlsUrl`
+  (works everywhere, ~2-5s delay) — play it in a `<video>` tag with
+  [hls.js](https://github.com/video-dev/hls.js).
+- **`kind: "hls"`** → play `directUrl` straight in a `<video>` tag with
+  hls.js — it's the vendor's own CDN URL, not proxied through this server.
+- **`kind: "embed"`** → `directUrl` is a page, not a media URL — load it
+  in an `<iframe>` instead.
 
-Calling `GET /api/stream/DL1PC0001` with no `?cam=` reports currently-active
-sessions only — it does **not** start anything, so it returns `[]` for a
-bus nobody has watched yet even if that bus is really online. Always pass
-`?cam=N` when you want a specific camera to actually come up.
-
-### Get a recording from the last hour
+## 4. Get a recording from the last hour
 
 ```
 GET /api/stream/DL1PC0001/recording?from=2026-07-06T10:00:00Z&to=2026-07-06T10:02:00Z
@@ -136,232 +103,22 @@ GET /api/stream/DL1PC0001/recording?from=2026-07-06T10:00:00Z&to=2026-07-06T10:0
 ```
 
 Open `url` directly — it's a playable/downloadable mp4 clip. Only the
-**last 1 hour** of video is kept; older windows return nothing.
+**last 1 hour** of video is kept; older windows return nothing. Add
+`?cam=2` to get just one camera instead of all of them.
 
-Add `?cam=2` to get just one camera instead of all of them.
-
-## 4. Quick cheat sheet
+## Cheat sheet
 
 | I want to... | Call this |
 |---|---|
 | See all buses (and nudge everything to start) | `GET /api/fleet` |
 | See one bus's cameras in detail | `GET /api/bus/{busId}` |
 | Watch one specific camera live (starts it if needed) | `GET /api/stream/{busId}?cam=2` |
-| Check currently-active sessions for a bus (won't start anything) | `GET /api/stream/{busId}` |
 | Watch a past moment | `GET /api/stream/{busId}/recording?from=...&to=...` |
-| Start a vendor-managed bus manually (see section 6) | `POST /api/bridge/start` |
 | Check the server is alive | `GET /health` |
 
-## 5. Things to know
+## Things to know
 
-- Bus IDs and camera counts are **not fixed** — the server figures out who's
-  online by watching who's currently streaming. Nothing to register.
-- `GET /api/fleet` does double duty: besides reporting current state, every
-  hit also triggers a background pass that discovers buses straight from
-  each vendor's own account (Chemito, Sumith) and starts any cam that
-  isn't already live — so polling `/api/fleet` from the frontend is what
-  keeps the fleet self-healing, not just a status read. This is throttled
-  (at most once every ~20s) so rapid polling doesn't hammer vendor logins.
-- A bus a vendor account reports (Chemito's device list, Sumith's vehicle
-  list) shows up and streams automatically — no manual config needed for
-  those two vendors anymore. `config/buses.json` is now only required for
-  vendors that can't be listed this way (Castmaster, N9M — see section 6).
-- Recordings only cover the **last hour**. Anything older is gone.
+- Bus IDs and camera counts are **not fixed** — the server discovers them
+  from real camera traffic and vendor accounts. Nothing to register.
 - This is a dev setup: no login/auth yet. Don't expose it to the public
-  internet as-is — see `prototype/REMOTE_BUSES_SETUP.md` for production
-  hardening notes.
-- Full endpoint list is also always available by hitting the API root:
-  `GET /` on `http://localhost:4000`.
-
-## 6. Bringing a vendor camera device into the fleet
-
-Cameras don't all speak plain RTMP — some are managed by a vendor platform
-instead. The frontend never needs to know which vendor is behind a bus:
-call the same endpoints as section 3 (`GET /api/fleet`, `GET /api/stream/
-{busId}?cam=N`) with just the bus id and camera number.
-
-For Chemito and Sumith specifically, there's nothing to register at all —
-every bus/device that vendor's account reports is discovered and started
-automatically (see section 5). `config/buses.json` below is only needed
-for vendors with no listing API (Castmaster, N9M) or to manually pin a
-specific vendor device id to a bus id.
-
-### Quick cheat sheet
-
-| I want to... | Call this |
-|---|---|
-| Start watching a vendor-managed bus | `POST /api/bridge/start` |
-| See what's currently bridged | `GET /api/bridge` |
-| Stop a bridged camera | `POST /api/bridge/stop?key={bus}_{cam}` |
-
-```
-POST /api/bridge/start
-Content-Type: application/json
-
-{ "bus": "DL1PC0001", "cam": 1, "main": true, "audio": false }
-```
-
-Response — shape depends on the vendor behind that bus, but the frontend
-doesn't need to branch on which one; `kind` says how to play it:
-
-```json
-{ "key": "DL1PC0001_1", "kind": "rtsp", "rtspOut": "rtsp://localhost:8554/DL1PC0001_1" }
-```
-```json
-{ "key": "DL1PC0001_1", "kind": "embed", "embedUrl": "https://trakzee2.uffizio.com/jsp/..." }
-```
-- `kind: "rtsp"` → play `rtspOut` same as section 3 (it shows up in
-  `GET /api/fleet` / `GET /api/stream/{busId}` too).
-- `kind: "embed"` → load `embedUrl` in an iframe; no MediaMTX path is
-  created for this one.
-
-This needs two config files the frontend never sees:
-`config/vendors.json` (each vendor's account credentials) and
-`config/buses.json` (which vendor + device id each bus uses) — see
-`config/*.json.example` for the shape. A bus not listed in `buses.json`
-returns `404`. Requires the `ffmpeg` binary on `PATH` at runtime.
-
-### Admin/debug: calling one vendor directly
-
-Everything below (6a-6c) is what `/api/bridge/start` calls internally,
-kept around for debugging one vendor in isolation and for looking up the
-device ids that go into `config/buses.json` (e.g.
-`GET /api/bridge/n9m/devices` to find a `dsno`). The frontend shouldn't
-need any of this.
-
-### 6a. Castmaster-managed CCTV (HTTP)
-
-If the bus's cameras are registered on a Castmaster NVR/CCTV server, call:
-
-```
-POST /api/bridge/castmaster/start
-Content-Type: application/json
-
-{
-  "baseUrl": "https://cmmipl.org:22056",
-  "username": "admin",
-  "password": "...",
-  "terid": "<vendor device serial number>",
-  "channel": 1,
-  "main": true,
-  "audio": false,
-  "bus": "DL1PC0001",
-  "cam": 1
-}
-```
-
-This logs into Castmaster, resolves the live FLV URL for that device
-channel, and starts a supervised `ffmpeg` remux into
-`rtsp://.../DL1PC0001_1`. Response:
-
-```json
-{ "key": "DL1PC0001_1", "path": "DL1PC0001_1", "rtspOut": "rtsp://localhost:8554/DL1PC0001_1" }
-```
-
-The bus now shows up in `GET /api/fleet` and `GET /api/stream/DL1PC0001`
-like any other camera.
-
-### 6b. Chemito N9M devices (direct TCP)
-
-N9M devices connect straight to this server instead of to a third-party
-platform. Two extra TCP listeners run alongside the HTTP API (env vars
-`N9M_SIGNAL_ADDR` / `N9M_MEDIA_ADDR`, default `:9500` signaling / `:9501`
-media) — point the device's server IP/port configuration at those.
-
-Check which devices are currently connected:
-
-```
-GET /api/bridge/n9m/devices
-```
-
-```json
-[{ "dsno": "00600052B8", "devName": "Dik3339", "carNum": "AP36TS1234", "connectedAt": "..." }]
-```
-
-Once a device shows up, start its live feed:
-
-```
-POST /api/bridge/n9m/start
-Content-Type: application/json
-
-{
-  "dsno": "00600052B8",
-  "bus": "DL1PC0001",
-  "cam": 1,
-  "channel": 1,
-  "main": true,
-  "audio": false,
-  "format": "h264"
-}
-```
-
-This asks the connected device to open a media stream, reads the raw
-elementary-stream frames off it, and republishes them via `ffmpeg` into
-`rtsp://.../DL1PC0001_1` — same response shape and same fleet/stream
-visibility as Castmaster above.
-
-### 6c. Stopping / listing bridge jobs
-
-```
-GET  /api/bridge                 # status of every active bridge job
-POST /api/bridge/stop?key=DL1PC0001_1
-```
-
-`key` is the `{bus}_{cam}` value returned by either start call above.
-
-### 6d. Using the vendor protocol packages directly (Go)
-
-If you're writing Go code against this repo instead of calling the HTTP
-bridge, each vendor protocol has its own package under
-`prototype/backend/vendorclients/`:
-
-| Package | Protocol | What it's for |
-|---|---|---|
-| `castmaster` | Castmaster HTTP CCTV API | Login, live/playback video URLs, alarms, evidence-center, VOIP talk-token |
-| `n9m` + `n9mserver` | Chemito N9M (JSON-over-TCP) | Device status/control, alarm decoding, and the TCP listener that accepts inbound device connections |
-| `sumith` | Sumith CCU-SCU (pipe-delimited ASCII) | OBU login/location/health/alarm reporting, route/duty tracking, CCU→OBU device config, SMS command channel |
-| `t808` | OBU-to-Server binary protocol | Register/auth, location report (with alarm/status bitflags), attendance, operation requests, driving-plan schedules, CAN bus upload |
-
-Example — decode an inbound Sumith frame:
-
-```go
-import "mediamtx-console/vendorclients/sumith"
-
-codec := sumith.NewCodec()
-frame, err := codec.ParseVerify(rawLine) // validates checksum
-if err != nil { /* handle */ }
-switch frame.Token {
-case "LGN":
-    login, err := sumith.DecodeLogin(frame)
-case "NR", "NM":
-    loc, err := sumith.DecodeLocation(frame)
-}
-```
-
-Example — build a t808 location report to send:
-
-```go
-import "mediamtx-console/vendorclients/t808"
-
-body, _ := t808.BuildLocationReport(t808.LocationReport{
-    AlarmFlags: t808.AlarmOverSpeed,
-    Status:     t808.StatusACCOn | t808.StatusPositioned,
-    Latitude:   19973921, Longitude: 73805160, // degrees * 1e6
-    Elevation: 610, Speed: 0, Direction: 247,
-    Time: t808.BCDDateTime{Year: 25, Month: 7, Day: 28, Hour: 12, Minute: 0, Second: 0},
-})
-raw, _ := t808.Build(t808.Frame{MsgID: t808.MsgIDLocationReport, Phone: "008291915608", Serial: 1, Body: body})
-```
-
-Every package has a `_test.go` file alongside it showing a working
-build/parse round trip for each message type — the fastest way to see the
-exact shape a given message expects.
-
-**Known gaps, called out in code comments where they matter:**
-- `t808`: the source doc never documents byte-stuffing/escaping for 0x7E
-  inside a frame, or a subpackage/fragmentation bit layout. `Build`/`Parse`
-  don't apply escaping by default; `EscapeJT808`/`UnescapeJT808` are
-  provided as an opt-in if a real device turns out to need it.
-- `sumith`: the checksum algorithm is ambiguous in the source doc; this
-  implementation defaults to CRC-32/IEEE rendered as 8 hex digits,
-  overridable via `Codec.Checksum`.
+  internet as-is.
