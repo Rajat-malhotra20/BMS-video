@@ -1,7 +1,6 @@
 package main
 
 import (
-	"context"
 	"errors"
 	"log"
 	"net"
@@ -9,13 +8,10 @@ import (
 	"net/http/httputil"
 	"net/url"
 	"os"
-	"strconv"
 	"strings"
-	"sync"
 	"time"
 
 	vendorconfig "mediamtx-console/config"
-	"mediamtx-console/domain"
 	"mediamtx-console/services"
 	"mediamtx-console/vendorclients/n9mserver"
 	"mediamtx-console/vendors"
@@ -142,23 +138,15 @@ func main() {
 	}
 	ubrs := newUnifiedBridgeServer(streamSvc, buses)
 
-	// Discover and start every bus/cam — both on real GET /api/fleet
-	// traffic (so a hit always sees things filling in, throttled so rapid
-	// polling doesn't re-trigger a vendor sweep every request) and on a
-	// slow background tick (so buses keep coming up even with nobody
-	// watching). The background interval is intentionally long: hammering
-	// a vendor's stream-start endpoint every few seconds for a channel
-	// that's never wired to a real camera has tripped a vendor-side rate
-	// limit before (see supervisor.go's backoff fix) — a 3-minute floor
-	// keeps that risk far lower while still self-healing without traffic.
-	trigger := newFleetAutoStarter(streamSvc, buses, ubrs, 20*time.Second)
-	api.autoStart = trigger
-	go func() {
-		for {
-			time.Sleep(3 * time.Minute)
-			trigger()
-		}
-	}()
+	// Streams are on-demand only, for every vendor — nothing starts until
+	// GET /api/stream/{id}?cam=N (or POST /api/bridge/start) explicitly
+	// asks for it. An earlier version eagerly auto-started every channel
+	// in the background, but some devices (Chemito) have a small real
+	// concurrent-live-session capacity, and holding channels open that
+	// nobody's watching burns through it — better to only occupy a slot
+	// for a channel someone's actually viewing. /api/fleet's bus listing
+	// (which buses exist at all) still comes from api.vendorRoster below,
+	// independent of whether anything's actually streaming.
 
 	// So GET /api/fleet (and /api/bus/{id}, /api/stream/{id}) also see
 	// buses live via an embed-kind vendor, which never touch MediaMTX —
@@ -216,114 +204,6 @@ func main() {
 	log.Printf("fleet-bms-api listening on %s", cfg.addr)
 	if err := server.ListenAndServe(); err != nil && !errors.Is(err, http.ErrServerClosed) {
 		log.Fatal(err)
-	}
-}
-
-// sumithliveDefaultChannels covers vendors with no per-device channel-count
-// API (sumithlive's ListVehicles has no such field) — matches the observed
-// 4-camera embed grid.
-// ponytail: hardcoded assumption, not a real vendor value; raise it (or add
-// a per-bus override in config/buses.json) if a vehicle actually has more.
-const sumithliveDefaultChannels = 4
-
-// maxAutoStartChannelsPerBus caps how many channels we ever attempt for one
-// bus, regardless of what the vendor's own device-count reports. A DVR/NVR's
-// reported channel count is how many camera inputs it has wired, not how
-// many it can stream live simultaneously — Chemito reports 9 for DLPD8611
-// but repeatedly returns "500 CreateLiveStream failed" account-wide once
-// ~4-5 channels are held open at once, including for channels that had been
-// working fine. IsActive can't tell a genuinely-live channel apart from one
-// stuck retrying forever (both register as "active" the moment Start is
-// called), so the only reliable fix is to never attempt beyond this cap.
-// ponytail: conservative guess, not a confirmed device spec; raise per-bus
-// if the real capacity is confirmed higher.
-const maxAutoStartChannelsPerBus = 4
-
-// newFleetAutoStarter returns a fire-and-forget trigger for GET /api/fleet:
-// each call runs autoStartAllCams in the background (never blocking the
-// HTTP response) unless one is already running or ran within minInterval —
-// so real traffic drives discovery/starting instead of an independent
-// background poll that keeps hitting vendors even when nobody's watching.
-func newFleetAutoStarter(streamSvc *services.StreamService, buses map[string]vendorconfig.Bus, ubrs *unifiedBridgeServer, minInterval time.Duration) func() {
-	var mu sync.Mutex
-	var running bool
-	var lastRun time.Time
-
-	return func() {
-		mu.Lock()
-		if running || time.Since(lastRun) < minInterval {
-			mu.Unlock()
-			return
-		}
-		running = true
-		mu.Unlock()
-
-		go func() {
-			autoStartAllCams(streamSvc, buses, ubrs)
-			mu.Lock()
-			running = false
-			lastRun = time.Now()
-			mu.Unlock()
-		}()
-	}
-}
-
-func autoStartAllCams(streamSvc *services.StreamService, buses map[string]vendorconfig.Bus, ubrs *unifiedBridgeServer) {
-	ctx := context.Background()
-	discovered := make(map[string]bool)
-
-	// Auto-discovered: every bus a vendor account itself reports, using the
-	// exact vendor + params (terid, plateNo, ...) that account gave us —
-	// no config/buses.json entry needed, so a bus a vendor adds shows up
-	// and streams with zero config changes.
-	for _, entry := range streamSvc.VendorRoster(ctx) {
-		busID := strings.TrimSuffix(entry.Key, "_1")
-		discovered[busID] = true
-		n := entry.Channels
-		if n == 0 {
-			n = sumithliveDefaultChannels
-		}
-		if n > maxAutoStartChannelsPerBus {
-			n = maxAutoStartChannelsPerBus
-		}
-		for cam := 1; cam <= n; cam++ {
-			key := busID + "_" + strconv.Itoa(cam)
-			if streamSvc.IsActive(key) {
-				// Wakes it up immediately if it's stuck sleeping between
-				// failed attempts — a no-op if it's already streaming fine.
-				streamSvc.Nudge(key)
-				continue
-			}
-			if _, err := streamSvc.StartStream(ctx, domain.StreamRequest{
-				Bus:          busID,
-				Cam:          cam,
-				Vendor:       entry.Vendor,
-				Main:         true,
-				VendorParams: entry.VendorParams,
-			}); err != nil {
-				log.Printf("auto-stream: %s cam %d: %v", busID, cam, err)
-			}
-			// Stagger fresh starts on the same device — asking a DVR/NVR to
-			// open several live-session channels in the same instant can
-			// exceed its own concurrent-stream capacity (distinct from a
-			// request-rate limit) and reject all of them with a server
-			// error, even ones that work fine started one at a time.
-			time.Sleep(2 * time.Second)
-		}
-	}
-
-	// config/buses.json is only a fallback now, for vendors that can't be
-	// listed (e.g. n9m devices connect in themselves; castmaster has no
-	// ListCameras support) — anything the roster already found is skipped.
-	for busID := range buses {
-		if discovered[busID] {
-			continue
-		}
-		for cam := 1; cam <= sumithliveDefaultChannels; cam++ {
-			if _, err := ubrs.ensureStream(ctx, busID, cam); err != nil {
-				log.Printf("auto-stream: %s cam %d: %v", busID, cam, err)
-			}
-		}
 	}
 }
 

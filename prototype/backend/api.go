@@ -40,15 +40,6 @@ type apiServer struct {
 	// bus isn't configured for bridging at all.
 	ensureStream func(ctx context.Context, bus string, cam int) (*domain.StreamResult, error)
 
-	// autoStart, if set, is triggered on every GET /api/fleet hit — it
-	// discovers and starts every bus/cam a vendor reports, so the fleet
-	// view fills in on its own from real traffic rather than an
-	// independent background poll running (and hitting vendors) even when
-	// nobody's watching. Fire-and-forget: never blocks the response, and
-	// throttles itself internally so rapid polling doesn't re-trigger a
-	// fresh vendor sweep on every single request.
-	autoStart func()
-
 	cacheMu     sync.Mutex
 	cachedFleet *fleetSummary
 	cachedPaths []mtxPath
@@ -264,9 +255,6 @@ func (a *apiServer) snapshot() (*fleetSummary, []mtxPath, error) {
 }
 
 func (a *apiServer) handleFleet(w http.ResponseWriter, _ *http.Request) {
-	if a.autoStart != nil {
-		a.autoStart()
-	}
 	summary, _, err := a.snapshot()
 	if err != nil {
 		log.Printf("fleet: mediamtx api error: %v", err)
