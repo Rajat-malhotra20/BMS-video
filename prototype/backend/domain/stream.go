@@ -75,4 +75,9 @@ type Camera struct {
 	// vendor may report a device online without anyone having called
 	// StartStream for it yet). False when the vendor has no such signal.
 	Online bool
+	// Channels is how many cam numbers this vendor knows this device has
+	// (e.g. Chemito's per-device channelcount), for auto-starting every
+	// cam without a human picking one first. 0 when the vendor has no such
+	// count (e.g. sumithlive) — callers fall back to a default.
+	Channels int
 }

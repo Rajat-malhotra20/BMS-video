@@ -149,19 +149,14 @@ func (c *Client) Login(username, password string) (string, error) {
 	return c.key, nil
 }
 
-// VideoPort is one available live-preview relay port.
-//
-// The "Get video port information" call is referenced by the doc's §4
-// operation steps but not itself documented in
-// docs/vendors/chemito/PMIDTC_CIPLAPIS.xlsx. This mirrors castmaster's
-// equivalent endpoint (same OEM platform, identical envelope/error-code
-// shape) — confirmed live against the real Chemito server (2026-08-18,
-// account "admin"): GET /api/v1/basic/live/port returns
-// {"data":[],"errorcode":200}. The endpoint is real; an empty result means
-// no device currently has an active live relay — a device can be
-// registered (see ListDevices) without one, e.g. it's offline right now.
+// VideoPort is one available live-preview relay port. This is the
+// connectable port for LiveVideoURL — confirmed live 2026-08-19: a device's
+// own ListDevices "transmitport" resets the connection immediately, while
+// a port from here (e.g. 12060) serves the actual FLV stream. Requires the
+// "key" query param like every other call — omitting it (as this used to)
+// makes the server return an empty list rather than an auth error.
 func (c *Client) LivePorts() ([]VideoPort, error) {
-	req, err := http.NewRequest(http.MethodGet, c.BaseURL+"/api/v1/basic/live/port", nil)
+	req, err := http.NewRequest(http.MethodGet, c.BaseURL+"/api/v1/basic/live/port?key="+url.QueryEscape(c.key), nil)
 	if err != nil {
 		return nil, err
 	}
@@ -180,11 +175,6 @@ type Device struct {
 	CarLicence   string `json:"carlicence"`
 	ChannelCount int    `json:"channelcount"`
 	DeviceType   int    `json:"devicetype"`
-	// TransmitPort is this device's own live-relay port (confirmed live
-	// 2026-08-19: e.g. 17891 for DLPD8611). LivePorts()/"/live/port" always
-	// returns an empty list on this account, so this per-device field is
-	// the only real source for the port LiveVideoURL needs.
-	TransmitPort int `json:"transmitport"`
 }
 
 // ListDevices returns every device registered on this account — this is

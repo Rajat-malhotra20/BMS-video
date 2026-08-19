@@ -49,6 +49,10 @@ type RosterEntry struct {
 	Vendor string
 	Label  string // human-readable name (plate, car licence, ...) — empty if the vendor gave none
 	Online bool
+	// Channels is Camera.Channels passed through — how many cam numbers
+	// this bus has, per the vendor's own listing. 0 when the vendor
+	// doesn't report one.
+	Channels int
 }
 
 // VendorRoster sweeps every registered vendor's ListCameras and returns
@@ -78,10 +82,11 @@ func (s *StreamService) VendorRoster(ctx context.Context) []RosterEntry {
 				label = "" // no extra info beyond the id itself — nothing worth surfacing separately
 			}
 			entries = append(entries, RosterEntry{
-				Key:    c.VendorID + "_1",
-				Vendor: adapter.Name(),
-				Label:  label,
-				Online: c.Online,
+				Key:      c.VendorID + "_1",
+				Vendor:   adapter.Name(),
+				Label:    label,
+				Online:   c.Online,
+				Channels: c.Channels,
 			})
 		}
 	}

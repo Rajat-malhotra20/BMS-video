@@ -1,6 +1,7 @@
 package main
 
 import (
+	"context"
 	"errors"
 	"log"
 	"net"
@@ -138,6 +139,13 @@ func main() {
 	}
 	ubrs := newUnifiedBridgeServer(streamSvc, buses)
 
+	// Keep every configured bus's cams live in the background — the fleet
+	// view shouldn't depend on a human calling bridge/start or
+	// /api/stream/{id}?cam=N first. ensureStream is cheap to re-poll (an
+	// in-memory IsActive check) for cams already running; Supervisor's own
+	// backoff handles retrying a cam that's failing to connect.
+	startFleetAutoStreamer(streamSvc, buses, ubrs, 20*time.Second)
+
 	// So GET /api/fleet (and /api/bus/{id}, /api/stream/{id}) also see
 	// buses live via an embed-kind vendor, which never touch MediaMTX —
 	// both ones someone has explicitly started (directKeys) and everything
@@ -194,6 +202,51 @@ func main() {
 	log.Printf("fleet-bms-api listening on %s", cfg.addr)
 	if err := server.ListenAndServe(); err != nil && !errors.Is(err, http.ErrServerClosed) {
 		log.Fatal(err)
+	}
+}
+
+// sumithliveDefaultChannels covers vendors with no per-device channel-count
+// API (sumithlive's ListVehicles has no such field) — matches the observed
+// 4-camera embed grid.
+// ponytail: hardcoded assumption, not a real vendor value; raise it (or add
+// a per-bus override in config/buses.json) if a vehicle actually has more.
+const sumithliveDefaultChannels = 4
+
+// startFleetAutoStreamer background-polls every configured bus and starts
+// (or confirms already-running) each of its cams, so the fleet view is
+// always live without a human triggering it per bus/cam first.
+func startFleetAutoStreamer(streamSvc *services.StreamService, buses map[string]vendorconfig.Bus, ubrs *unifiedBridgeServer, interval time.Duration) {
+	go func() {
+		for {
+			autoStartAllCams(streamSvc, buses, ubrs)
+			time.Sleep(interval)
+		}
+	}()
+}
+
+func autoStartAllCams(streamSvc *services.StreamService, buses map[string]vendorconfig.Bus, ubrs *unifiedBridgeServer) {
+	ctx := context.Background()
+
+	// Real per-device channel counts, keyed by bus id, from whatever
+	// vendors report one (e.g. Chemito's channelcount) — buses.json has no
+	// such field, so this is the only source for it.
+	channels := make(map[string]int)
+	for _, entry := range streamSvc.VendorRoster(ctx) {
+		if entry.Channels > 0 {
+			channels[strings.TrimSuffix(entry.Key, "_1")] = entry.Channels
+		}
+	}
+
+	for busID := range buses {
+		n := channels[busID]
+		if n == 0 {
+			n = sumithliveDefaultChannels
+		}
+		for cam := 1; cam <= n; cam++ {
+			if _, err := ubrs.ensureStream(ctx, busID, cam); err != nil {
+				log.Printf("auto-stream: %s cam %d: %v", busID, cam, err)
+			}
+		}
 	}
 }
 

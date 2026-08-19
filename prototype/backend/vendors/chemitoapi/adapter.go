@@ -25,9 +25,16 @@ func New(cfg Config) *Adapter { return &Adapter{cfg: cfg} }
 
 func (a *Adapter) Name() string { return "chemitoapi" }
 
-// ResolveLiveSource logs in, resolves the device's own relay port, and
-// requests the FLV live-video URL (§4 of the doc) — always KindRTSP, since
+// ResolveLiveSource logs in, resolves an available relay port (§4 of the
+// doc's operation steps — "Get video port information" then "Get device
+// list"), and requests the FLV live-video URL — always KindRTSP, since
 // Chemito hands back a raw stream URL to remux, same as castmaster.
+//
+// The device's own "transmitport" field (from ListDevices) is NOT a
+// connectable stream port — confirmed live 2026-08-19: connecting to it
+// resets immediately, while a port from LivePorts() (e.g. 12060) serves the
+// actual FLV stream. transmitport only reappears as the response's fixed
+// "svrport" value, unrelated to the host:port you connect to.
 func (a *Adapter) ResolveLiveSource(ctx context.Context, req domain.StreamRequest) (domain.LiveSource, error) {
 	client := rawclient.NewClient(a.cfg.BaseURL, nil)
 	if _, err := client.Login(a.cfg.Username, a.cfg.Password); err != nil {
@@ -36,25 +43,16 @@ func (a *Adapter) ResolveLiveSource(ctx context.Context, req domain.StreamReques
 
 	terid := req.VendorParams["terid"]
 
-	// LivePorts()/"/live/port" always returns an empty list on this
-	// account (see client.go), so the port comes from the device's own
-	// "transmitport" field instead — devices list is small, one round trip.
-	devices, err := client.ListDevices()
+	ports, err := client.LivePorts()
 	if err != nil {
-		return domain.LiveSource{}, domain.WrapVendorErr("chemitoapi", "list devices", err)
+		return domain.LiveSource{}, domain.WrapVendorErr("chemitoapi", "list live ports", err)
 	}
-	var port int
-	for _, d := range devices {
-		if d.Terid == terid {
-			port = d.TransmitPort
-			break
-		}
-	}
-	if port == 0 {
+	if len(ports) == 0 {
 		return domain.LiveSource{}, &domain.VendorError{
 			Vendor: "chemitoapi", Op: "resolve live source", Code: "no_live_ports", Retryable: true,
 		}
 	}
+	port := ports[0].Port
 
 	channel := req.Cam // the vendor's device channel — same number as our own {bus}_{cam}, not a separate config value
 	if channel == 0 {
@@ -104,6 +102,7 @@ func (a *Adapter) ListCameras(ctx context.Context, params map[string]string) ([]
 			VendorID:     id,
 			Label:        id,
 			VendorParams: map[string]string{"terid": d.Terid},
+			Channels:     d.ChannelCount,
 		}
 	}
 	return cams, nil
