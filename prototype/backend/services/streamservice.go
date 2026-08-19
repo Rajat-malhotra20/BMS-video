@@ -53,6 +53,9 @@ type RosterEntry struct {
 	// this bus has, per the vendor's own listing. 0 when the vendor
 	// doesn't report one.
 	Channels int
+	// VendorParams is ready to hand straight to StartStream for this bus —
+	// lets a caller auto-start it without a config/buses.json entry.
+	VendorParams map[string]string
 }
 
 // VendorRoster sweeps every registered vendor's ListCameras and returns
@@ -82,11 +85,12 @@ func (s *StreamService) VendorRoster(ctx context.Context) []RosterEntry {
 				label = "" // no extra info beyond the id itself — nothing worth surfacing separately
 			}
 			entries = append(entries, RosterEntry{
-				Key:      c.VendorID + "_1",
-				Vendor:   adapter.Name(),
-				Label:    label,
-				Online:   c.Online,
-				Channels: c.Channels,
+				Key:          c.VendorID + "_1",
+				Vendor:       adapter.Name(),
+				Label:        label,
+				Online:       c.Online,
+				Channels:     c.Channels,
+				VendorParams: c.VendorParams,
 			})
 		}
 	}

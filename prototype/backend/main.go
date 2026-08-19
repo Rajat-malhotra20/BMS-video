@@ -9,10 +9,12 @@ import (
 	"net/http/httputil"
 	"net/url"
 	"os"
+	"strconv"
 	"strings"
 	"time"
 
 	vendorconfig "mediamtx-console/config"
+	"mediamtx-console/domain"
 	"mediamtx-console/services"
 	"mediamtx-console/vendorclients/n9mserver"
 	"mediamtx-console/vendors"
@@ -226,23 +228,44 @@ func startFleetAutoStreamer(streamSvc *services.StreamService, buses map[string]
 
 func autoStartAllCams(streamSvc *services.StreamService, buses map[string]vendorconfig.Bus, ubrs *unifiedBridgeServer) {
 	ctx := context.Background()
+	discovered := make(map[string]bool)
 
-	// Real per-device channel counts, keyed by bus id, from whatever
-	// vendors report one (e.g. Chemito's channelcount) — buses.json has no
-	// such field, so this is the only source for it.
-	channels := make(map[string]int)
+	// Auto-discovered: every bus a vendor account itself reports, using the
+	// exact vendor + params (terid, plateNo, ...) that account gave us —
+	// no config/buses.json entry needed, so a bus a vendor adds shows up
+	// and streams with zero config changes.
 	for _, entry := range streamSvc.VendorRoster(ctx) {
-		if entry.Channels > 0 {
-			channels[strings.TrimSuffix(entry.Key, "_1")] = entry.Channels
-		}
-	}
-
-	for busID := range buses {
-		n := channels[busID]
+		busID := strings.TrimSuffix(entry.Key, "_1")
+		discovered[busID] = true
+		n := entry.Channels
 		if n == 0 {
 			n = sumithliveDefaultChannels
 		}
 		for cam := 1; cam <= n; cam++ {
+			key := busID + "_" + strconv.Itoa(cam)
+			if streamSvc.IsActive(key) {
+				continue
+			}
+			if _, err := streamSvc.StartStream(ctx, domain.StreamRequest{
+				Bus:          busID,
+				Cam:          cam,
+				Vendor:       entry.Vendor,
+				Main:         true,
+				VendorParams: entry.VendorParams,
+			}); err != nil {
+				log.Printf("auto-stream: %s cam %d: %v", busID, cam, err)
+			}
+		}
+	}
+
+	// config/buses.json is only a fallback now, for vendors that can't be
+	// listed (e.g. n9m devices connect in themselves; castmaster has no
+	// ListCameras support) — anything the roster already found is skipped.
+	for busID := range buses {
+		if discovered[busID] {
+			continue
+		}
+		for cam := 1; cam <= sumithliveDefaultChannels; cam++ {
 			if _, err := ubrs.ensureStream(ctx, busID, cam); err != nil {
 				log.Printf("auto-stream: %s cam %d: %v", busID, cam, err)
 			}
