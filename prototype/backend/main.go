@@ -226,6 +226,19 @@ func main() {
 // a per-bus override in config/buses.json) if a vehicle actually has more.
 const sumithliveDefaultChannels = 4
 
+// maxAutoStartChannelsPerBus caps how many channels we ever attempt for one
+// bus, regardless of what the vendor's own device-count reports. A DVR/NVR's
+// reported channel count is how many camera inputs it has wired, not how
+// many it can stream live simultaneously — Chemito reports 9 for DLPD8611
+// but repeatedly returns "500 CreateLiveStream failed" account-wide once
+// ~4-5 channels are held open at once, including for channels that had been
+// working fine. IsActive can't tell a genuinely-live channel apart from one
+// stuck retrying forever (both register as "active" the moment Start is
+// called), so the only reliable fix is to never attempt beyond this cap.
+// ponytail: conservative guess, not a confirmed device spec; raise per-bus
+// if the real capacity is confirmed higher.
+const maxAutoStartChannelsPerBus = 4
+
 // newFleetAutoStarter returns a fire-and-forget trigger for GET /api/fleet:
 // each call runs autoStartAllCams in the background (never blocking the
 // HTTP response) unless one is already running or ran within minInterval —
@@ -269,6 +282,9 @@ func autoStartAllCams(streamSvc *services.StreamService, buses map[string]vendor
 		n := entry.Channels
 		if n == 0 {
 			n = sumithliveDefaultChannels
+		}
+		if n > maxAutoStartChannelsPerBus {
+			n = maxAutoStartChannelsPerBus
 		}
 		for cam := 1; cam <= n; cam++ {
 			key := busID + "_" + strconv.Itoa(cam)
