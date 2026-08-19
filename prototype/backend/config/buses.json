@@ -1,0 +1,10 @@
+{
+  "GJ03BZ0327": { "vendor": "sumithlive", "vendorParams": { "plateNo": "GJ03BZ0327", "projectId": "37" } },
+  "GJ03BZ2174": { "vendor": "sumithlive", "vendorParams": { "plateNo": "GJ03BZ2174", "projectId": "37" } },
+  "GJ03BZ2388": { "vendor": "sumithlive", "vendorParams": { "plateNo": "GJ03BZ2388", "projectId": "37" } },
+  "GJ03BZ4198": { "vendor": "sumithlive", "vendorParams": { "plateNo": "GJ03BZ4198", "projectId": "37" } },
+  "GJ03BZ4392": { "vendor": "sumithlive", "vendorParams": { "plateNo": "GJ03BZ4392", "projectId": "37" } },
+  "GJ03CU0096": { "vendor": "sumithlive", "vendorParams": { "plateNo": "GJ03CU0096", "projectId": "37" } },
+  "GJ03CU0206": { "vendor": "sumithlive", "vendorParams": { "plateNo": "GJ03CU0206", "projectId": "37" } },
+  "DLPD8611": { "vendor": "chemitoapi", "vendorParams": { "terid": "00C400403F" } }
+}
