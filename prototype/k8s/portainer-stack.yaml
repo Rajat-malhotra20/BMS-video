@@ -58,12 +58,10 @@ data:
           - action: metrics
 
     pathDefaults:
-      record: yes
-      recordPath: /recordings/%path/%Y-%m-%d_%H-%M-%S-%f
-      recordFormat: fmp4
-      recordPartDuration: 1s
-      recordSegmentDuration: 60s
-      recordDeleteAfter: 1h
+      # No local recording: clips/evidence are fetched from the vendor APIs,
+      # so there is no volume to write to. This makes GET /api/buses/{id}/recording
+      # return playback URLs with nothing behind them.
+      record: no
 
     paths:
       all_others:
@@ -72,9 +70,9 @@ data:
 ---
 # Vendor-less bridge config (see prototype/backend/config/*.json.example).
 # vendors.json's passwords are deliberately left empty here — they come
-# from the vendor-credentials Secret below instead, via VENDOR_<NAME>_
-# PASSWORD env vars (config/vendors.go fills a blank password from that
-# env var). Edit buses.json here to add/reassign a bus; no image rebuild
+# from the separate vendor-credentials ConfigMap instead, via
+# VENDOR_<NAME>_PASSWORD env vars (config/vendors.go fills a blank
+# password from that env var). Edit buses.json here to add/reassign a bus; no image rebuild
 # needed, just `kubectl apply` + a rollout restart (mounted config, same
 # as mediamtx.yml below).
 apiVersion: v1
@@ -102,27 +100,13 @@ data:
     }
 
 ---
-# vendor-credentials Secret (passwords) is NOT defined here on purpose —
-# same reasoning as the ecr-pull secret below: a real-value Secret must
-# never live in a file that gets `kubectl apply`'d repeatedly, or the next
-# apply resets it to whatever placeholder is committed. Create it once,
-# out-of-band, before applying this file — see DEPLOY.md. All three keys
-# must exist (even as empty strings) or the Deployment's secretKeyRef
-# below fails to start the pod.
-
----
-apiVersion: v1
-kind: PersistentVolumeClaim
-metadata:
-  name: recordings-pvc
-  namespace: bms-dev
-spec:
-  accessModes:
-    - ReadWriteOnce
-  resources:
-    requests:
-      storage: 5Gi
-  # storageClassName: <set to your cluster's default/RWO storage class if needed>
+# vendor-credentials (the passwords) is NOT defined here on purpose — same
+# reasoning as ecr-pull-secret: real credential values must never live in a
+# file that gets `kubectl apply`'d repeatedly, or the next apply resets them
+# to whatever placeholder is committed. Create it once, out-of-band, with
+# keys castmaster-password / sumithlive-password / chemitoapi-password —
+# see DEPLOY.md. The configMapKeyRefs below are optional, so the pod starts
+# without it; a vendor whose password is missing just can't authenticate.
 
 ---
 # Single container: MediaMTX + Go API run together (supervisord). Backend reaches
@@ -135,7 +119,7 @@ metadata:
 spec:
   replicas: 1
   strategy:
-    type: Recreate   # single RWO recordings volume — never run 2 pods at once
+    type: Recreate   # never run 2 pods at once — both would publish to livefeed
   selector:
     matchLabels:
       app: bms-video
@@ -144,11 +128,22 @@ spec:
       labels:
         app: bms-video
     spec:
-      # Image is pulled from ECR. Requires registry auth on the cluster:
-      # either a Portainer ECR registry (auto-refreshes the token) or the
-      # ecr-pull secret below (manual ~12h refresh). See DEPLOY.md.
+      # ip-172-31-4-81 has no outbound internet (egress-dead) — vendor calls to
+      # trakzee2.uffizio.com get TCP RST there. Keep this pod off that node.
+      affinity:
+        nodeAffinity:
+          requiredDuringSchedulingIgnoredDuringExecution:
+            nodeSelectorTerms:
+              - matchExpressions:
+                  - key: kubernetes.io/hostname
+                    operator: NotIn
+                    values:
+                      - "ip-172-31-4-81"
+      # Image is pulled from ECR. ecr-pull-secret is the namespace's
+      # maintained registry credential — the other bms-dev deployments use
+      # it too, so it stays refreshed. See DEPLOY.md.
       imagePullSecrets:
-        - name: ecr-pull
+        - name: ecr-pull-secret
       containers:
         - name: bms-video
           image: 475560691356.dkr.ecr.ap-south-1.amazonaws.com/bms/video/dev:latest
@@ -176,22 +171,27 @@ spec:
             # Passwords only — the rest of each vendor's config comes from
             # the vendors-config ConfigMap (mounted below); this fills in
             # the blank "password" field config/vendors.go leaves for env
-            # override. See the vendor-credentials Secret note above.
+            # override. optional: true because vendors.go reads these with
+            # os.Getenv and skips an unset one, so a missing key just leaves
+            # that vendor's bridge unusable instead of stopping the pod.
             - name: VENDOR_CASTMASTER_PASSWORD
               valueFrom:
-                secretKeyRef:
+                configMapKeyRef:
                   name: vendor-credentials
                   key: castmaster-password
+                  optional: true
             - name: VENDOR_SUMITHLIVE_PASSWORD
               valueFrom:
-                secretKeyRef:
+                configMapKeyRef:
                   name: vendor-credentials
                   key: sumithlive-password
+                  optional: true
             - name: VENDOR_CHEMITOAPI_PASSWORD
               valueFrom:
-                secretKeyRef:
+                configMapKeyRef:
                   name: vendor-credentials
                   key: chemitoapi-password
+                  optional: true
           ports:
             - containerPort: 8080
               protocol: TCP   # Go JSON API (the one API)
@@ -209,8 +209,6 @@ spec:
               subPath: mediamtx.yml
             - name: vendor-config
               mountPath: /config
-            - name: recordings
-              mountPath: /recordings
           readinessProbe:
             httpGet:
               path: /health
@@ -233,9 +231,6 @@ spec:
           securityContext:
             runAsNonRoot: true
             runAsUser: 10001
-      securityContext:
-        # fsGroup makes the mounted recordings PVC writable by the app user
-        fsGroup: 10001
       volumes:
         - name: config
           configMap:
@@ -243,9 +238,6 @@ spec:
         - name: vendor-config
           configMap:
             name: vendors-config
-        - name: recordings
-          persistentVolumeClaim:
-            claimName: recordings-pvc
 
 ---
 # The one API — HLS/WebRTC/playback/mtx-api all proxied through here on :8080.
