@@ -43,10 +43,21 @@ func (e *ErrAlreadyRunning) Error() string {
 	return fmt.Sprintf("bridge: job %q already running", e.Key)
 }
 
-// Start launches run under key, restarting it after backoff whenever it
-// returns a non-nil error, until Stop(key) is called. It returns
-// ErrAlreadyRunning if key is already active.
-func (s *Supervisor) Start(key string, run RunFunc, backoff time.Duration) error {
+// maxBackoff caps the exponential backoff below so a permanently failing
+// job (e.g. a vendor channel that isn't wired to a real camera) settles
+// down to one attempt every 5 minutes instead of hammering the vendor
+// forever at the initial rate. There's no reset-on-success heuristic here:
+// a vendor timeout (itself often 30s+) is indistinguishable by duration
+// alone from a genuine connect, so backoff only ever grows for a job's
+// lifetime — cheap insurance against hammering a vendor, at the cost of a
+// flaky-but-working stream retrying slower after its first drop.
+const maxBackoff = 5 * time.Minute
+
+// Start launches run under key, restarting it after an exponentially
+// growing backoff (starting at initialBackoff, doubling per attempt up to
+// maxBackoff) whenever it returns a non-nil error, until Stop(key) is
+// called. It returns ErrAlreadyRunning if key is already active.
+func (s *Supervisor) Start(key string, run RunFunc, initialBackoff time.Duration) error {
 	s.mu.Lock()
 	if _, exists := s.jobs[key]; exists {
 		s.mu.Unlock()
@@ -59,6 +70,7 @@ func (s *Supervisor) Start(key string, run RunFunc, backoff time.Duration) error
 
 	go func() {
 		defer close(j.done)
+		backoff := initialBackoff
 		for {
 			err := run(ctx)
 			j.mu.Lock()
@@ -69,10 +81,17 @@ func (s *Supervisor) Start(key string, run RunFunc, backoff time.Duration) error
 			if ctx.Err() != nil {
 				return
 			}
+
 			select {
 			case <-ctx.Done():
 				return
 			case <-time.After(backoff):
+			}
+			if backoff < maxBackoff {
+				backoff *= 2
+				if backoff > maxBackoff {
+					backoff = maxBackoff
+				}
 			}
 		}
 	}()
