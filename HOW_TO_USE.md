@@ -81,24 +81,46 @@ Returns bitrate, codec, and viewer count for each of that bus's cameras.
 ### Get a playable video link for a bus
 
 ```
-GET /api/stream/DL1PC0001
+GET /api/stream/DL1PC0001?cam=1
 ```
+
+If that bus/cam isn't already live, this call starts it on demand (vendor
+login + resolve happens right here) — the frontend never has to call
+`POST /api/bridge/start` itself. First call after a bus has been idle can
+take a few seconds while the stream connects; poll again if `ready` isn't
+`true` yet.
+
+Response shape depends on how that camera is actually delivered — check
+`kind` (or whether `kind` is present at all) to decide how to play it:
 
 ```json
 [
-  { "cam": 1, "path": "DL1PC0001_1", "ready": true,
+  { "cam": 1, "path": "DL1PC0001_1", "ready": true, "tracks": ["H264"],
+    "bytesReceived": 2820466, "readers": 0,
     "whepUrl": "/whep/DL1PC0001_1/whep",
     "hlsUrl": "/live/DL1PC0001_1/index.m3u8" }
 ]
 ```
+```json
+[
+  { "cam": 1, "path": "GJ03CU0206_1", "ready": true,
+    "kind": "hls", "directUrl": "https://rtmpvideo.uffizio.com/hls/864819050951795_cam1.m3u8" }
+]
+```
 
-- `whepUrl` — for low-latency live video (WebRTC). Use this first.
-- `hlsUrl` — fallback, works everywhere, ~2-5 second delay.
+- No `kind` field → a normal remuxed RTSP camera (direct push, Castmaster,
+  Chemito, N9M). Use `whepUrl` first (low-latency WebRTC), `hlsUrl` as a
+  ~2-5s-delay fallback that works everywhere.
+- `kind: "hls"` → play `directUrl` straight in a `<video>` tag with
+  [hls.js](https://github.com/video-dev/hls.js) — it's the vendor's own CDN
+  URL, not proxied through this server.
+- `kind: "embed"` → `directUrl` is a page, not a media URL; load it in an
+  `<iframe>` instead (`GET /api/bus/{id}` also reports this shape per cam).
 
-Add `?cam=2` to get just one camera instead of all of them.
-
-Play `hlsUrl` directly in any `<video>` tag with [hls.js](https://github.com/video-dev/hls.js),
-or use a WHEP client library for `whepUrl`.
+Calling `GET /api/stream/DL1PC0001` with no `?cam=` reports currently-active
+sessions only — it does **not** start anything, so it returns `[]` for a
+bus nobody has watched yet even if that bus is really online. Always pass
+`?cam=N` when you want a specific camera to actually come up.
 
 ### Get a recording from the last hour
 
@@ -122,18 +144,28 @@ Add `?cam=2` to get just one camera instead of all of them.
 
 | I want to... | Call this |
 |---|---|
-| See all buses | `GET /api/fleet` |
+| See all buses (and nudge everything to start) | `GET /api/fleet` |
 | See one bus's cameras in detail | `GET /api/bus/{busId}` |
-| Watch a bus live | `GET /api/stream/{busId}` |
-| Watch one specific camera live | `GET /api/stream/{busId}?cam=2` |
+| Watch one specific camera live (starts it if needed) | `GET /api/stream/{busId}?cam=2` |
+| Check currently-active sessions for a bus (won't start anything) | `GET /api/stream/{busId}` |
 | Watch a past moment | `GET /api/stream/{busId}/recording?from=...&to=...` |
-| Start a vendor-managed bus (see section 6) | `POST /api/bridge/start` |
+| Start a vendor-managed bus manually (see section 6) | `POST /api/bridge/start` |
 | Check the server is alive | `GET /health` |
 
 ## 5. Things to know
 
 - Bus IDs and camera counts are **not fixed** — the server figures out who's
   online by watching who's currently streaming. Nothing to register.
+- `GET /api/fleet` does double duty: besides reporting current state, every
+  hit also triggers a background pass that discovers buses straight from
+  each vendor's own account (Chemito, Sumith) and starts any cam that
+  isn't already live — so polling `/api/fleet` from the frontend is what
+  keeps the fleet self-healing, not just a status read. This is throttled
+  (at most once every ~20s) so rapid polling doesn't hammer vendor logins.
+- A bus a vendor account reports (Chemito's device list, Sumith's vehicle
+  list) shows up and streams automatically — no manual config needed for
+  those two vendors anymore. `config/buses.json` is now only required for
+  vendors that can't be listed this way (Castmaster, N9M — see section 6).
 - Recordings only cover the **last hour**. Anything older is gone.
 - This is a dev setup: no login/auth yet. Don't expose it to the public
   internet as-is — see `prototype/REMOTE_BUSES_SETUP.md` for production
@@ -144,9 +176,15 @@ Add `?cam=2` to get just one camera instead of all of them.
 ## 6. Bringing a vendor camera device into the fleet
 
 Cameras don't all speak plain RTMP — some are managed by a vendor platform
-instead. The frontend never needs to know which: register the bus once in
-a config file, then call one endpoint with just the bus id and camera
-number, same as section 3.
+instead. The frontend never needs to know which vendor is behind a bus:
+call the same endpoints as section 3 (`GET /api/fleet`, `GET /api/stream/
+{busId}?cam=N`) with just the bus id and camera number.
+
+For Chemito and Sumith specifically, there's nothing to register at all —
+every bus/device that vendor's account reports is discovered and started
+automatically (see section 5). `config/buses.json` below is only needed
+for vendors with no listing API (Castmaster, N9M) or to manually pin a
+specific vendor device id to a bus id.
 
 ### Quick cheat sheet
 
