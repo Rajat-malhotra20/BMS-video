@@ -5,6 +5,7 @@ package services
 import (
 	"context"
 	"fmt"
+	"log"
 	"strconv"
 	"sync"
 	"time"
@@ -68,6 +69,7 @@ func (s *StreamService) VendorRoster(ctx context.Context) []RosterEntry {
 	for _, adapter := range s.Registry.All() {
 		cams, err := adapter.ListCameras(ctx, nil)
 		if err != nil {
+			log.Printf("vendor roster: %s: ListCameras: %v", adapter.Name(), err)
 			continue
 		}
 		for _, c := range cams {

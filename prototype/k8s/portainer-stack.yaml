@@ -91,7 +91,7 @@ data:
   vendors.json: |
     {
       "castmaster": { "baseUrl": "https://cmmipl.org:22056", "username": "admin", "password": "" },
-      "sumithlive": { "baseUrl": "https://trakzee2.uffizio.com", "username": "", "password": "", "extra": { "projectId": "" } },
+      "sumithlive": { "baseUrl": "https://trakzee2.uffizio.com", "username": "vishvam@Login.com", "password": "", "extra": { "projectId": "37" } },
       "chemitoapi": { "baseUrl": "http://15.252.130.159:12056", "username": "admin", "password": "" }
     }
   buses.json: |
