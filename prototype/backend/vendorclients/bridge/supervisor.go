@@ -19,6 +19,7 @@ type RunFunc func(ctx context.Context) error
 type job struct {
 	cancel   context.CancelFunc
 	done     chan struct{}
+	kick     chan struct{}
 	mu       sync.Mutex
 	lastErr  error
 	attempts int
@@ -75,7 +76,7 @@ func (s *Supervisor) Start(key string, run RunFunc, initialBackoff time.Duration
 		return &ErrAlreadyRunning{Key: key}
 	}
 	ctx, cancel := context.WithCancel(context.Background())
-	j := &job{cancel: cancel, done: make(chan struct{})}
+	j := &job{cancel: cancel, done: make(chan struct{}), kick: make(chan struct{}, 1)}
 	s.jobs[key] = j
 	s.mu.Unlock()
 
@@ -109,6 +110,16 @@ func (s *Supervisor) Start(key string, run RunFunc, initialBackoff time.Duration
 			select {
 			case <-ctx.Done():
 				return
+			case <-j.kick:
+				// Real traffic (someone actually requesting this bus/cam
+				// again) wants a fresh attempt now instead of waiting out
+				// the backoff — only takes effect while sleeping here
+				// between attempts, never interrupts a run already in
+				// progress. Reset backoff too: a kicked retry is a fresh
+				// chance, not a continuation of a losing streak.
+				backoff = initialBackoff
+				consecutiveMaxouts = 0
+				continue
 			case <-time.After(sleepFor):
 			}
 			if backoff < maxBackoff {
@@ -120,6 +131,28 @@ func (s *Supervisor) Start(key string, run RunFunc, initialBackoff time.Duration
 		}
 	}()
 	return nil
+}
+
+// Kick wakes a job that's currently sleeping between failed attempts,
+// giving it a fresh (backoff-reset) retry right away instead of waiting out
+// however much of its backoff remains — for when real traffic (someone
+// actually requesting this bus/cam) shows up on a job stuck retrying slowly
+// or in its give-up cooldown. A no-op if the job is currently mid-run
+// (already streaming, or the RunFunc call itself is in flight) or doesn't
+// exist. Reports whether a job was found under key, not whether it was
+// actually sleeping at the time.
+func (s *Supervisor) Kick(key string) bool {
+	s.mu.Lock()
+	j, ok := s.jobs[key]
+	s.mu.Unlock()
+	if !ok {
+		return false
+	}
+	select {
+	case j.kick <- struct{}{}:
+	default:
+	}
+	return true
 }
 
 // Stop cancels and removes the job registered under key. It reports whether

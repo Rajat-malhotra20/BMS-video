@@ -179,6 +179,15 @@ func (s *StreamService) IsActive(key string) bool {
 	return ok
 }
 
+// Nudge wakes an RTSP job that's currently sleeping between failed retry
+// attempts, so real traffic for a bus/cam stuck in backoff (or its
+// give-up cooldown) gets a fresh attempt now instead of waiting out
+// however long is left. A no-op for a direct (embed/HLS) session — those
+// don't retry via Supervisor — or a job that doesn't exist.
+func (s *StreamService) Nudge(key string) {
+	s.Supervisor.Kick(key)
+}
+
 func (s *StreamService) StopStream(key string) bool {
 	s.directMu.Lock()
 	_, wasDirect := s.directActive[key]

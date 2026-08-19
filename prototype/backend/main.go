@@ -289,6 +289,9 @@ func autoStartAllCams(streamSvc *services.StreamService, buses map[string]vendor
 		for cam := 1; cam <= n; cam++ {
 			key := busID + "_" + strconv.Itoa(cam)
 			if streamSvc.IsActive(key) {
+				// Wakes it up immediately if it's stuck sleeping between
+				// failed attempts — a no-op if it's already streaming fine.
+				streamSvc.Nudge(key)
 				continue
 			}
 			if _, err := streamSvc.StartStream(ctx, domain.StreamRequest{

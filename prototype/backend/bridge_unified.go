@@ -89,7 +89,12 @@ func (u *unifiedBridgeServer) startBus(ctx context.Context, bus string, cam int,
 func (u *unifiedBridgeServer) ensureStream(ctx context.Context, bus string, cam int) (*domain.StreamResult, error) {
 	key := bus + "_" + strconv.Itoa(cam)
 	if u.stream.IsActive(key) {
-		return nil, nil // already live — let the normal cache path report it, don't re-trigger the vendor
+		// Someone's actively asking for this bus/cam again — if it's stuck
+		// sleeping between failed attempts (or in its give-up cooldown),
+		// give it a fresh try now instead of leaving it to wait out
+		// whatever's left. No-op if it's already streaming fine.
+		u.stream.Nudge(key)
+		return nil, nil // let the normal cache path report it, don't re-trigger the vendor's start call
 	}
 	result, configured, err := u.startBus(ctx, bus, cam, true, false)
 	if !configured {
