@@ -30,8 +30,14 @@ type mtxPath struct {
 type fleetBus struct {
 	ID       string `json:"id"`
 	Label    string `json:"label,omitempty"` // human-readable name (plate, car licence, ...) from a vendor roster — omitted when the id is already the readable name
-	Cams     []int  `json:"cams"`            // camera numbers currently live
+	Cams     []int  `json:"cams"`            // camera numbers currently live (actually streaming right now)
 	LastSeen int64  `json:"lastSeen"`        // unix seconds any cam was last live
+	// CamsAvailable is how many camera slots the vendor reports this bus
+	// having, independent of whether any are currently streaming — a cheap,
+	// no-session device-listing signal (see StreamService.ChannelCounts),
+	// refreshed on a slow cadence so a dashboard can show "this bus has N
+	// cameras" without anyone having opened one yet. 0 when unknown.
+	CamsAvailable int `json:"camsAvailable,omitempty"`
 }
 
 type fleetTotals struct {

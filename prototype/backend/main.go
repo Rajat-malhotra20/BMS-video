@@ -154,6 +154,7 @@ func main() {
 	// a vendor account reports knowing about (vendorRoster).
 	api.directKeys = streamSvc.ActiveDirectKeys
 	api.vendorRoster = streamSvc.VendorRoster
+	api.channelCounts = streamSvc.ChannelCounts
 
 	// GET /api/stream/{id}?cam=N starts the bridge on demand if it isn't
 	// already active — the frontend never has to call

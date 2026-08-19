@@ -7,6 +7,7 @@ import (
 	"fmt"
 	"log"
 	"strconv"
+	"strings"
 	"sync"
 	"time"
 
@@ -38,9 +39,18 @@ type StreamService struct {
 	rosterMu       sync.Mutex
 	rosterCache    []RosterEntry
 	rosterCachedAt time.Time
+
+	// channelCountsCache holds the last ChannelCounts() sweep — a much
+	// slower-refreshing view than rosterCache, since a device's channel
+	// count rarely changes and there's no reason to recompute it as often
+	// as the roster's other (session-adjacent) signals.
+	channelCountsMu       sync.Mutex
+	channelCountsCache    map[string]int
+	channelCountsCachedAt time.Time
 }
 
 const rosterCacheTTL = 30 * time.Second
+const channelCountsCacheTTL = 30 * time.Minute
 
 // RosterEntry is one camera a vendor account reports knowing about,
 // whether or not anyone has ever called StartStream for it.
@@ -100,6 +110,37 @@ func (s *StreamService) VendorRoster(ctx context.Context) []RosterEntry {
 	s.rosterCachedAt = time.Now()
 	s.rosterMu.Unlock()
 	return entries
+}
+
+// ChannelCounts returns, per bus id, how many camera slots a vendor reports
+// that bus having — independent of whether any are currently streaming.
+// Purely informational (e.g. so a dashboard can show "this bus has N
+// cameras" before anyone's opened one): it only reuses VendorRoster's
+// device-listing data, never opens a live session, so it can't interfere
+// with an active stream or a device's concurrent-session capacity. Cached
+// far longer than the roster itself (channelCountsCacheTTL) since a
+// device's channel count rarely changes.
+func (s *StreamService) ChannelCounts(ctx context.Context) map[string]int {
+	s.channelCountsMu.Lock()
+	if s.channelCountsCache != nil && time.Since(s.channelCountsCachedAt) < channelCountsCacheTTL {
+		cached := s.channelCountsCache
+		s.channelCountsMu.Unlock()
+		return cached
+	}
+	s.channelCountsMu.Unlock()
+
+	counts := make(map[string]int)
+	for _, entry := range s.VendorRoster(ctx) {
+		if entry.Channels > 0 {
+			counts[strings.TrimSuffix(entry.Key, "_1")] = entry.Channels
+		}
+	}
+
+	s.channelCountsMu.Lock()
+	s.channelCountsCache = counts
+	s.channelCountsCachedAt = time.Now()
+	s.channelCountsMu.Unlock()
+	return counts
 }
 
 // StartStream resolves req.Vendor's adapter, builds the remux/embed

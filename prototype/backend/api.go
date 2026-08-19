@@ -40,6 +40,12 @@ type apiServer struct {
 	// bus isn't configured for bridging at all.
 	ensureStream func(ctx context.Context, bus string, cam int) (*domain.StreamResult, error)
 
+	// channelCounts, if set, reports how many camera slots a vendor says
+	// each bus has, independent of whether any are currently streaming —
+	// display-only, no live session involved. Slow-refreshing (see
+	// StreamService.ChannelCounts) since it rarely changes.
+	channelCounts func(ctx context.Context) map[string]int
+
 	cacheMu     sync.Mutex
 	cachedFleet *fleetSummary
 	cachedPaths []mtxPath
@@ -254,14 +260,28 @@ func (a *apiServer) snapshot() (*fleetSummary, []mtxPath, error) {
 	return a.cachedFleet, a.cachedPaths, nil
 }
 
-func (a *apiServer) handleFleet(w http.ResponseWriter, _ *http.Request) {
+func (a *apiServer) handleFleet(w http.ResponseWriter, r *http.Request) {
 	summary, _, err := a.snapshot()
 	if err != nil {
 		log.Printf("fleet: mediamtx api error: %v", err)
 		http.Error(w, "mediamtx unavailable", http.StatusBadGateway)
 		return
 	}
-	writeJSON(w, summary)
+
+	out := *summary
+	if a.channelCounts != nil {
+		// Copy before mutating — summary is the shared cached pointer;
+		// annotating it in place would race with concurrent readers and
+		// leak into the cache.
+		counts := a.channelCounts(r.Context())
+		buses := make([]fleetBus, len(out.Buses))
+		copy(buses, out.Buses)
+		for i := range buses {
+			buses[i].CamsAvailable = counts[buses[i].ID]
+		}
+		out.Buses = buses
+	}
+	writeJSON(w, out)
 }
 
 type camDetail struct {
