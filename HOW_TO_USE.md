@@ -22,11 +22,10 @@ GET /api/fleet
 ```
 
 - `cams` lists which camera numbers are currently live. An empty list means
-  that bus was seen recently but isn't streaming right now.
-- Calling this also nudges the server to discover and start any bus/cam
-  that isn't live yet — polling `/api/fleet` regularly (e.g. every 10-20s)
-  is what keeps the fleet view filling in on its own, not just a status
-  read. No need to poll faster than every ~20s; it's throttled anyway.
+  either nobody's watching that bus right now, or it's not streaming —
+  streams are on-demand (see endpoint 3), not auto-started in the
+  background, so an idle bus with real cameras still shows `cams: []`
+  until something requests one.
 
 ## 2. Get detail for one bus
 
@@ -110,7 +109,7 @@ Open `url` directly — it's a playable/downloadable mp4 clip. Only the
 
 | I want to... | Call this |
 |---|---|
-| See all buses (and nudge everything to start) | `GET /api/fleet` |
+| See all buses | `GET /api/fleet` |
 | See one bus's cameras in detail | `GET /api/bus/{busId}` |
 | Watch one specific camera live (starts it if needed) | `GET /api/stream/{busId}?cam=2` |
 | Watch a past moment | `GET /api/stream/{busId}/recording?from=...&to=...` |
