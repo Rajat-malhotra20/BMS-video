@@ -333,6 +333,17 @@ func reverseProxy(target string, stripPrefix string, decorate func(http.Header))
 		}
 	}
 	proxy.ModifyResponse = func(resp *http.Response) error {
+		// MediaMTX sets its own CORS headers on HLS/WebRTC/playback
+		// responses; the outer cors() middleware already sets the
+		// canonical one for this app. httputil.ReverseProxy adds (not
+		// replaces) headers when copying the upstream response, so
+		// without this the client sees two Access-Control-Allow-Origin
+		// values — which browsers correctly treat as invalid and refuse.
+		resp.Header.Del("Access-Control-Allow-Origin")
+		resp.Header.Del("Access-Control-Allow-Methods")
+		resp.Header.Del("Access-Control-Allow-Headers")
+		resp.Header.Del("Vary")
+
 		if decorate != nil {
 			decorate(resp.Header)
 		}
