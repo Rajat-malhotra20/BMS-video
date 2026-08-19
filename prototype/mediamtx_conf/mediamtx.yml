@@ -23,7 +23,7 @@ webrtcAdditionalHosts: [127.0.0.1]
 webrtcLocalUDPAddress: :18189
 
 hlsAlwaysRemux: yes        # keep HLS segments flowing even with no active reader
-hlsVariant: mpegts         # broadest compatibility with hls.js
+hlsVariant: fmp4           # mpegts crashed reliably every 1-2min on Chemito's B-frame pattern ("too many reordered frames"); fmp4 confirmed crash-free
 hlsSegmentCount: 7
 hlsSegmentDuration: 1s
 hlsPartDuration: 200ms

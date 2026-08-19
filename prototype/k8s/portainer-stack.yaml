@@ -35,7 +35,7 @@ data:
     webrtcLocalUDPAddress: :18189
 
     hlsAlwaysRemux: yes
-    hlsVariant: mpegts
+    hlsVariant: fmp4
     hlsSegmentCount: 7
     hlsSegmentDuration: 1s
     hlsPartDuration: 200ms
