@@ -11,6 +11,7 @@ import (
 	"os"
 	"strconv"
 	"strings"
+	"sync"
 	"time"
 
 	vendorconfig "mediamtx-console/config"
@@ -141,12 +142,23 @@ func main() {
 	}
 	ubrs := newUnifiedBridgeServer(streamSvc, buses)
 
-	// Keep every configured bus's cams live in the background — the fleet
-	// view shouldn't depend on a human calling bridge/start or
-	// /api/stream/{id}?cam=N first. ensureStream is cheap to re-poll (an
-	// in-memory IsActive check) for cams already running; Supervisor's own
-	// backoff handles retrying a cam that's failing to connect.
-	startFleetAutoStreamer(streamSvc, buses, ubrs, 20*time.Second)
+	// Discover and start every bus/cam — both on real GET /api/fleet
+	// traffic (so a hit always sees things filling in, throttled so rapid
+	// polling doesn't re-trigger a vendor sweep every request) and on a
+	// slow background tick (so buses keep coming up even with nobody
+	// watching). The background interval is intentionally long: hammering
+	// a vendor's stream-start endpoint every few seconds for a channel
+	// that's never wired to a real camera has tripped a vendor-side rate
+	// limit before (see supervisor.go's backoff fix) — a 3-minute floor
+	// keeps that risk far lower while still self-healing without traffic.
+	trigger := newFleetAutoStarter(streamSvc, buses, ubrs, 20*time.Second)
+	api.autoStart = trigger
+	go func() {
+		for {
+			time.Sleep(3 * time.Minute)
+			trigger()
+		}
+	}()
 
 	// So GET /api/fleet (and /api/bus/{id}, /api/stream/{id}) also see
 	// buses live via an embed-kind vendor, which never touch MediaMTX —
@@ -214,16 +226,33 @@ func main() {
 // a per-bus override in config/buses.json) if a vehicle actually has more.
 const sumithliveDefaultChannels = 4
 
-// startFleetAutoStreamer background-polls every configured bus and starts
-// (or confirms already-running) each of its cams, so the fleet view is
-// always live without a human triggering it per bus/cam first.
-func startFleetAutoStreamer(streamSvc *services.StreamService, buses map[string]vendorconfig.Bus, ubrs *unifiedBridgeServer, interval time.Duration) {
-	go func() {
-		for {
-			autoStartAllCams(streamSvc, buses, ubrs)
-			time.Sleep(interval)
+// newFleetAutoStarter returns a fire-and-forget trigger for GET /api/fleet:
+// each call runs autoStartAllCams in the background (never blocking the
+// HTTP response) unless one is already running or ran within minInterval —
+// so real traffic drives discovery/starting instead of an independent
+// background poll that keeps hitting vendors even when nobody's watching.
+func newFleetAutoStarter(streamSvc *services.StreamService, buses map[string]vendorconfig.Bus, ubrs *unifiedBridgeServer, minInterval time.Duration) func() {
+	var mu sync.Mutex
+	var running bool
+	var lastRun time.Time
+
+	return func() {
+		mu.Lock()
+		if running || time.Since(lastRun) < minInterval {
+			mu.Unlock()
+			return
 		}
-	}()
+		running = true
+		mu.Unlock()
+
+		go func() {
+			autoStartAllCams(streamSvc, buses, ubrs)
+			mu.Lock()
+			running = false
+			lastRun = time.Now()
+			mu.Unlock()
+		}()
+	}
 }
 
 func autoStartAllCams(streamSvc *services.StreamService, buses map[string]vendorconfig.Bus, ubrs *unifiedBridgeServer) {
