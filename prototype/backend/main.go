@@ -284,6 +284,12 @@ func autoStartAllCams(streamSvc *services.StreamService, buses map[string]vendor
 			}); err != nil {
 				log.Printf("auto-stream: %s cam %d: %v", busID, cam, err)
 			}
+			// Stagger fresh starts on the same device — asking a DVR/NVR to
+			// open several live-session channels in the same instant can
+			// exceed its own concurrent-stream capacity (distinct from a
+			// request-rate limit) and reject all of them with a server
+			// error, even ones that work fine started one at a time.
+			time.Sleep(2 * time.Second)
 		}
 	}
 
