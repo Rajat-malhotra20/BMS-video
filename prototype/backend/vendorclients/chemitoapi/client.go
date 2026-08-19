@@ -180,6 +180,11 @@ type Device struct {
 	CarLicence   string `json:"carlicence"`
 	ChannelCount int    `json:"channelcount"`
 	DeviceType   int    `json:"devicetype"`
+	// TransmitPort is this device's own live-relay port (confirmed live
+	// 2026-08-19: e.g. 17891 for DLPD8611). LivePorts()/"/live/port" always
+	// returns an empty list on this account, so this per-device field is
+	// the only real source for the port LiveVideoURL needs.
+	TransmitPort int `json:"transmitport"`
 }
 
 // ListDevices returns every device registered on this account — this is

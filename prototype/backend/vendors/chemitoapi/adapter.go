@@ -25,26 +25,37 @@ func New(cfg Config) *Adapter { return &Adapter{cfg: cfg} }
 
 func (a *Adapter) Name() string { return "chemitoapi" }
 
-// ResolveLiveSource logs in, resolves a relay port, and requests the FLV
-// live-video URL (§4 of the doc) — always KindRTSP, since Chemito hands
-// back a raw stream URL to remux, same as castmaster.
+// ResolveLiveSource logs in, resolves the device's own relay port, and
+// requests the FLV live-video URL (§4 of the doc) — always KindRTSP, since
+// Chemito hands back a raw stream URL to remux, same as castmaster.
 func (a *Adapter) ResolveLiveSource(ctx context.Context, req domain.StreamRequest) (domain.LiveSource, error) {
 	client := rawclient.NewClient(a.cfg.BaseURL, nil)
 	if _, err := client.Login(a.cfg.Username, a.cfg.Password); err != nil {
 		return domain.LiveSource{}, domain.WrapVendorErr("chemitoapi", "login", err)
 	}
 
-	ports, err := client.LivePorts()
+	terid := req.VendorParams["terid"]
+
+	// LivePorts()/"/live/port" always returns an empty list on this
+	// account (see client.go), so the port comes from the device's own
+	// "transmitport" field instead — devices list is small, one round trip.
+	devices, err := client.ListDevices()
 	if err != nil {
-		return domain.LiveSource{}, domain.WrapVendorErr("chemitoapi", "list live ports", err)
+		return domain.LiveSource{}, domain.WrapVendorErr("chemitoapi", "list devices", err)
 	}
-	if len(ports) == 0 {
+	var port int
+	for _, d := range devices {
+		if d.Terid == terid {
+			port = d.TransmitPort
+			break
+		}
+	}
+	if port == 0 {
 		return domain.LiveSource{}, &domain.VendorError{
 			Vendor: "chemitoapi", Op: "resolve live source", Code: "no_live_ports", Retryable: true,
 		}
 	}
 
-	terid := req.VendorParams["terid"]
 	channel := req.Cam // the vendor's device channel — same number as our own {bus}_{cam}, not a separate config value
 	if channel == 0 {
 		channel = 1
@@ -54,7 +65,7 @@ func (a *Adapter) ResolveLiveSource(ctx context.Context, req domain.StreamReques
 	if req.Main {
 		st = rawclient.LiveStreamMain
 	}
-	url, err := client.LiveVideoURL(terid, channel, req.Audio, st, ports[0].Port)
+	url, err := client.LiveVideoURL(terid, channel, req.Audio, st, port)
 	if err != nil {
 		return domain.LiveSource{}, domain.WrapVendorErr("chemitoapi", "resolve live video url", err)
 	}
