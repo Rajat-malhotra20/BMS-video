@@ -45,13 +45,24 @@ func (e *ErrAlreadyRunning) Error() string {
 
 // maxBackoff caps the exponential backoff below so a permanently failing
 // job (e.g. a vendor channel that isn't wired to a real camera) settles
-// down to one attempt every 5 minutes instead of hammering the vendor
+// down to one attempt every 5 minutes rather than hammering the vendor
 // forever at the initial rate. There's no reset-on-success heuristic here:
 // a vendor timeout (itself often 30s+) is indistinguishable by duration
 // alone from a genuine connect, so backoff only ever grows for a job's
 // lifetime — cheap insurance against hammering a vendor, at the cost of a
 // flaky-but-working stream retrying slower after its first drop.
 const maxBackoff = 5 * time.Minute
+
+// giveUpAfterMaxouts / giveUpCooldown: some vendor devices have no way to
+// release a session once opened (Chemito's API has no stop/close call), so
+// every retry of a permanently-broken channel (e.g. an unwired camera slot)
+// leaves another phantom session open server-side — even at maxBackoff's
+// slow rate, that adds up over a long-lived process. After the backoff has
+// maxed out this many times in a row (a strong signal the job is never
+// going to succeed, not just having a bad minute), fall back hard to
+// giveUpCooldown before giving it one more fast-retry chance.
+const giveUpAfterMaxouts = 3
+const giveUpCooldown = 1 * time.Hour
 
 // Start launches run under key, restarting it after an exponentially
 // growing backoff (starting at initialBackoff, doubling per attempt up to
@@ -71,6 +82,7 @@ func (s *Supervisor) Start(key string, run RunFunc, initialBackoff time.Duration
 	go func() {
 		defer close(j.done)
 		backoff := initialBackoff
+		consecutiveMaxouts := 0
 		for {
 			err := run(ctx)
 			j.mu.Lock()
@@ -82,10 +94,22 @@ func (s *Supervisor) Start(key string, run RunFunc, initialBackoff time.Duration
 				return
 			}
 
+			sleepFor := backoff
+			if backoff >= maxBackoff {
+				consecutiveMaxouts++
+				if consecutiveMaxouts >= giveUpAfterMaxouts {
+					sleepFor = giveUpCooldown
+					consecutiveMaxouts = 0
+					backoff = initialBackoff // fresh, fast chance after the cooldown
+				}
+			} else {
+				consecutiveMaxouts = 0
+			}
+
 			select {
 			case <-ctx.Done():
 				return
-			case <-time.After(backoff):
+			case <-time.After(sleepFor):
 			}
 			if backoff < maxBackoff {
 				backoff *= 2
