@@ -1,6 +1,7 @@
 package main
 
 import (
+	"context"
 	"errors"
 	"log"
 	"net"
@@ -9,9 +10,11 @@ import (
 	"net/url"
 	"os"
 	"strings"
+	"sync"
 	"time"
 
 	vendorconfig "mediamtx-console/config"
+	"mediamtx-console/domain"
 	"mediamtx-console/services"
 	"mediamtx-console/vendorclients/n9mserver"
 	"mediamtx-console/vendors"
@@ -88,6 +91,7 @@ func main() {
 
 	api := newAPIServer(cfg.mediaMTXAPI)
 	mux.HandleFunc("GET /api/fleet", api.handleFleet)
+	mux.HandleFunc("GET /api/fleet/stream", api.handleFleetStream)
 	mux.HandleFunc("GET /api/bus/{id}", api.handleBusDetail)
 	mux.HandleFunc("GET /api/stream/{id}", api.handleStreamLive)
 	mux.HandleFunc("GET /api/stream/{id}/recording", api.handleStreamRecording)
@@ -138,15 +142,14 @@ func main() {
 	}
 	ubrs := newUnifiedBridgeServer(streamSvc, buses)
 
-	// Streams are on-demand only, for every vendor — nothing starts until
-	// GET /api/stream/{id}?cam=N (or POST /api/bridge/start) explicitly
-	// asks for it. An earlier version eagerly auto-started every channel
-	// in the background, but some devices (Chemito) have a small real
-	// concurrent-live-session capacity, and holding channels open that
-	// nobody's watching burns through it — better to only occupy a slot
-	// for a channel someone's actually viewing. /api/fleet's bus listing
-	// (which buses exist at all) still comes from api.vendorRoster below,
-	// independent of whether anything's actually streaming.
+	// One-time auto-start on process boot (redeploy/restart), so cams are
+	// already coming up by the time anyone looks instead of needing a
+	// first explicit request — but NOT a recurring background poll: some
+	// devices (Chemito) have a small real concurrent-live-session
+	// capacity, and continuously re-triggering burns through it for
+	// channels nobody's watching. After this one pass, everything is
+	// on-demand (GET /api/stream/{id}?cam=N, POST /api/bridge/start).
+	go runStartupAutoStart(streamSvc, buses)
 
 	// So GET /api/fleet (and /api/bus/{id}, /api/stream/{id}) also see
 	// buses live via an embed-kind vendor, which never touch MediaMTX —
@@ -186,6 +189,7 @@ func main() {
 			"service": "fleet-bms-api",
 			"endpoints": []string{
 				"GET /api/fleet",
+				"GET /api/fleet/stream",
 				"GET /api/bus/{id}",
 				"GET /api/stream/{id}",
 				"GET /api/stream/{id}/recording?from=&to=",
@@ -206,6 +210,78 @@ func main() {
 	if err := server.ListenAndServe(); err != nil && !errors.Is(err, http.ErrServerClosed) {
 		log.Fatal(err)
 	}
+}
+
+// startupAutoStartChannelsPerBus caps how many channels get started per bus
+// at boot, regardless of what the vendor's own device-count reports — a
+// DVR/NVR's reported channel count is how many camera inputs it has wired,
+// not how many it can stream live simultaneously (Chemito reports 9 for
+// DLPD8611 but has a real concurrent-session capacity far below that).
+// ponytail: conservative guess, not a confirmed device spec.
+const startupAutoStartChannelsPerBus = 4
+
+// maxConcurrentBusStarts bounds how many buses start in parallel at boot —
+// different buses are usually different vendor accounts/physical devices,
+// so running them concurrently is safe and makes a redeploy come up faster;
+// this just caps the burst against any one vendor's login endpoint.
+const maxConcurrentBusStarts = 3
+
+// runStartupAutoStart runs once, at process boot, so a redeploy comes up
+// with cams already live instead of waiting for a first explicit request.
+// Concurrency is bounded with a channel used as a semaphore (buffered chan
+// struct{}) plus a sync.WaitGroup to know when every bus has finished —
+// across buses/vendors run in parallel (bounded), but within one bus,
+// channels start sequentially with a short stagger, since those share one
+// device's limited concurrent-session capacity.
+func runStartupAutoStart(streamSvc *services.StreamService, buses map[string]vendorconfig.Bus) {
+	ctx := context.Background()
+	sem := make(chan struct{}, maxConcurrentBusStarts)
+	var wg sync.WaitGroup
+
+	startBusChannels := func(busID, vendor string, params map[string]string, n int) {
+		defer wg.Done()
+		sem <- struct{}{}
+		defer func() { <-sem }()
+
+		for cam := 1; cam <= n; cam++ {
+			if _, err := streamSvc.StartStream(ctx, domain.StreamRequest{
+				Bus:          busID,
+				Cam:          cam,
+				Vendor:       vendor,
+				Main:         true,
+				VendorParams: params,
+			}); err != nil {
+				log.Printf("startup-auto-start: %s cam %d: %v", busID, cam, err)
+			}
+			time.Sleep(2 * time.Second)
+		}
+	}
+
+	seen := make(map[string]bool)
+	for _, entry := range streamSvc.VendorRoster(ctx) {
+		busID := strings.TrimSuffix(entry.Key, "_1")
+		seen[busID] = true
+		n := entry.Channels
+		if n == 0 || n > startupAutoStartChannelsPerBus {
+			n = startupAutoStartChannelsPerBus
+		}
+		wg.Add(1)
+		go startBusChannels(busID, entry.Vendor, entry.VendorParams, n)
+	}
+
+	// config/buses.json is only a fallback here, for vendors that can't be
+	// listed (N9M devices connect in themselves; Castmaster has no
+	// ListCameras support) — anything the roster already found is skipped.
+	for busID, cfg := range buses {
+		if seen[busID] {
+			continue
+		}
+		wg.Add(1)
+		go startBusChannels(busID, cfg.Vendor, cfg.VendorParams, startupAutoStartChannelsPerBus)
+	}
+
+	wg.Wait()
+	log.Printf("startup-auto-start: done")
 }
 
 func env(key, fallback string) string {

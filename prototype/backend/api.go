@@ -260,12 +260,13 @@ func (a *apiServer) snapshot() (*fleetSummary, []mtxPath, error) {
 	return a.cachedFleet, a.cachedPaths, nil
 }
 
-func (a *apiServer) handleFleet(w http.ResponseWriter, r *http.Request) {
+// fleetSummaryWithCounts is handleFleet's and handleFleetStream's shared
+// core: the cached fleet snapshot, annotated with each bus's camsAvailable
+// count.
+func (a *apiServer) fleetSummaryWithCounts(ctx context.Context) (fleetSummary, error) {
 	summary, _, err := a.snapshot()
 	if err != nil {
-		log.Printf("fleet: mediamtx api error: %v", err)
-		http.Error(w, "mediamtx unavailable", http.StatusBadGateway)
-		return
+		return fleetSummary{}, err
 	}
 
 	out := *summary
@@ -273,7 +274,7 @@ func (a *apiServer) handleFleet(w http.ResponseWriter, r *http.Request) {
 		// Copy before mutating — summary is the shared cached pointer;
 		// annotating it in place would race with concurrent readers and
 		// leak into the cache.
-		counts := a.channelCounts(r.Context())
+		counts := a.channelCounts(ctx)
 		buses := make([]fleetBus, len(out.Buses))
 		copy(buses, out.Buses)
 		for i := range buses {
@@ -281,7 +282,58 @@ func (a *apiServer) handleFleet(w http.ResponseWriter, r *http.Request) {
 		}
 		out.Buses = buses
 	}
-	writeJSON(w, out)
+	return out, nil
+}
+
+func (a *apiServer) handleFleet(w http.ResponseWriter, r *http.Request) {
+	summary, err := a.fleetSummaryWithCounts(r.Context())
+	if err != nil {
+		log.Printf("fleet: mediamtx api error: %v", err)
+		http.Error(w, "mediamtx unavailable", http.StatusBadGateway)
+		return
+	}
+	writeJSON(w, summary)
+}
+
+// handleFleetStream serves the same data as GET /api/fleet, pushed over
+// Server-Sent Events as it changes instead of polled — so a frontend gets
+// updates as they happen without busy-polling /api/fleet. Plain net/http +
+// http.Flusher; no WebSocket library needed since this is one-way
+// (server → client) and the client never needs to send anything back over
+// this connection. A frame is only sent when the summary actually changed
+// since the last one, so an idle fleet doesn't spam empty updates.
+func (a *apiServer) handleFleetStream(w http.ResponseWriter, r *http.Request) {
+	flusher, ok := w.(http.Flusher)
+	if !ok {
+		http.Error(w, "streaming unsupported", http.StatusInternalServerError)
+		return
+	}
+
+	w.Header().Set("Content-Type", "text/event-stream")
+	w.Header().Set("Cache-Control", "no-cache")
+	w.Header().Set("Connection", "keep-alive")
+	w.WriteHeader(http.StatusOK)
+	flusher.Flush()
+
+	ticker := time.NewTicker(2 * time.Second)
+	defer ticker.Stop()
+
+	var lastSent string
+	for {
+		if summary, err := a.fleetSummaryWithCounts(r.Context()); err == nil {
+			if body, err := json.Marshal(summary); err == nil && string(body) != lastSent {
+				fmt.Fprintf(w, "data: %s\n\n", body)
+				flusher.Flush()
+				lastSent = string(body)
+			}
+		}
+
+		select {
+		case <-r.Context().Done():
+			return
+		case <-ticker.C:
+		}
+	}
 }
 
 type camDetail struct {

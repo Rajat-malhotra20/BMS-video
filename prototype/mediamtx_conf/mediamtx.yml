@@ -45,12 +45,11 @@ authInternalUsers:
       - action: metrics
 
 pathDefaults:
-  record: yes
-  recordPath: /recordings/%path/%Y-%m-%d_%H-%M-%S-%f
-  recordFormat: fmp4
-  recordPartDuration: 1s
-  recordSegmentDuration: 60s
-  recordDeleteAfter: 1h
+  # Recording disabled for now — matches production (evidence/clips are
+  # fetched from vendor APIs instead). GET /api/stream/{id}/recording will
+  # return playback URLs with nothing behind them until this is turned
+  # back on.
+  record: no
 
 paths:
   all_others:
