@@ -69,6 +69,16 @@ func (w *limitedWriter) Write(p []byte) (int, error) {
 // rtspOut as an RTSP publish. sourceURL may be an FLV/HTTP live URL (from
 // Castmaster's LiveVideoURL) or an HLS (.m3u8) URL (from HistoryStreamURL).
 // Requires the `ffmpeg` binary on PATH.
+//
+// Deliberately NOT using ffmpeg's own -reconnect* flags: tried it
+// 2026-08-20, and it made things worse for Chemito specifically. Its
+// sourceURL is a single-use/short-lived token (see the chemitoapi adapter's
+// per-retry re-resolve) — ffmpeg's -reconnect just reopens the exact same
+// URL forever without ever exiting, so it silently loops against an already
+// -dead token, never publishing and never letting Supervisor's retry (which
+// fetches a fresh token) run at all. Exiting on any drop and letting
+// Supervisor relaunch the RunFunc — which for chemitoapi re-resolves fresh
+// — is what actually recovers.
 func RemuxToRTSP(sourceURL, rtspOut string) RunFunc {
 	return func(ctx context.Context) error {
 		return runFFmpeg(ctx,
