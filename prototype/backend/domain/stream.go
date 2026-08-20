@@ -3,7 +3,10 @@
 // vendorclients/* package.
 package domain
 
-import "context"
+import (
+	"context"
+	"time"
+)
 
 type SourceKind string
 
@@ -21,6 +24,14 @@ type LiveSource struct {
 
 	EmbedURL string // set when Kind == KindEmbed
 	HLSURL   string // set when Kind == KindHLS
+
+	// RestartBackoff, if nonzero, overrides the service's default initial
+	// backoff for this RTSP job's Supervisor retries. Only the adapter
+	// knows its own vendor's real session behavior — e.g. Chemito's feed
+	// is a single-use/short-lived token that normally ends after a brief
+	// burst (confirmed live 2026-08-20, not a failure), so its default 5s
+	// floor made every reconnect feel like recovering from an error.
+	RestartBackoff time.Duration
 }
 
 // RemuxInput is anything the ffmpeg supervisor can consume as an upstream.

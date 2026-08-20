@@ -7,11 +7,22 @@ package chemitoapi
 
 import (
 	"context"
+	"time"
 
 	"mediamtx-console/domain"
 	"mediamtx-console/vendorclients/bridge"
 	rawclient "mediamtx-console/vendorclients/chemitoapi"
 )
+
+// restartBackoff is Chemito's own initial reconnect delay, shorter than the
+// service's general-purpose default. Confirmed live 2026-08-20: this
+// vendor's feed normally connects, streams a brief burst, then ends
+// cleanly by itself — not a failure, just how its session lifetime works —
+// so treating every reconnect like recovering from an error (the default
+// backoff floor) made it feel broken when it wasn't. Exponential growth and
+// the give-up cooldown (see vendorclients/bridge/supervisor.go) still apply
+// on top of this for a channel that's genuinely stuck.
+const restartBackoff = 2 * time.Second
 
 // Config is the per-vendor block loaded from config/vendors.go.
 type Config struct {
@@ -80,7 +91,7 @@ func (a *Adapter) ResolveLiveSource(ctx context.Context, req domain.StreamReques
 		return bridge.RemuxToRTSP(url, rtspOut)(ctx)
 	}
 
-	return domain.LiveSource{Kind: domain.KindRTSP, Remux: domain.RemuxInput{Run: run}}, nil
+	return domain.LiveSource{Kind: domain.KindRTSP, Remux: domain.RemuxInput{Run: run}, RestartBackoff: restartBackoff}, nil
 }
 
 // ListCameras returns every device registered on this account, via the

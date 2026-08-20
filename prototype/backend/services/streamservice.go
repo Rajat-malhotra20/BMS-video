@@ -207,7 +207,11 @@ func (s *StreamService) StartStream(ctx context.Context, req domain.StreamReques
 		if run == nil {
 			run = bridge.RemuxToRTSP(src.Remux.URL, req.RTSPOut)
 		}
-		if err := s.Supervisor.Start(key, run, s.RestartBackoff); err != nil {
+		backoff := s.RestartBackoff
+		if src.RestartBackoff > 0 {
+			backoff = src.RestartBackoff
+		}
+		if err := s.Supervisor.Start(key, run, backoff); err != nil {
 			return domain.StreamResult{}, err
 		}
 		return domain.StreamResult{Key: key, Kind: domain.KindRTSP, RTSPOut: req.RTSPOut}, nil
