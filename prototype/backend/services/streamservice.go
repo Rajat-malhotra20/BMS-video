@@ -143,6 +143,20 @@ func (s *StreamService) ChannelCounts(ctx context.Context) map[string]int {
 	return counts
 }
 
+// RosterVendor looks up which vendor + VendorParams a bus id resolves to,
+// straight from the vendor roster (Chemito's device list, Sumith's vehicle
+// list) — the same auto-discovery GET /api/fleet already shows bus listings
+// from. Lets a bus with no config/buses.json entry still be started
+// on-demand via GET /api/stream/{id}?cam=N, not just displayed.
+func (s *StreamService) RosterVendor(ctx context.Context, bus string) (vendor string, vendorParams map[string]string, ok bool) {
+	for _, entry := range s.VendorRoster(ctx) {
+		if strings.TrimSuffix(entry.Key, "_1") == bus {
+			return entry.Vendor, entry.VendorParams, true
+		}
+	}
+	return "", nil, false
+}
+
 // StartStream resolves req.Vendor's adapter, builds the remux/embed
 // result, and — for RTSP results — starts the supervised job. Never
 // branches on vendor name; only on the domain.SourceKind an adapter hands

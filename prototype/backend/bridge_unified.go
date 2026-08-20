@@ -60,21 +60,28 @@ func (u *unifiedBridgeServer) handleStart(w http.ResponseWriter, r *http.Request
 }
 
 // startBus is the shared core behind handleStart and ensureStream: look up
-// the bus's vendor+params from config and start it. ok=false (nil error)
-// means the bus simply isn't configured for bridging — not a failure, just
-// nothing to do.
+// the bus's vendor+params — first config/buses.json (a manual pin, or the
+// only option for a vendor with no listing API, like N9M/Castmaster), then
+// falling back to the vendor roster (Chemito's device list, Sumith's
+// vehicle list) so a bus that's only auto-discovered can still be started
+// on-demand, not just displayed. ok=false (nil error) means the bus isn't
+// findable either way — not a failure, just nothing to do.
 func (u *unifiedBridgeServer) startBus(ctx context.Context, bus string, cam int, main, audio bool) (result domain.StreamResult, ok bool, err error) {
-	busCfg, configured := u.buses[bus]
-	if !configured {
+	vendor, vendorParams := "", map[string]string(nil)
+	if busCfg, configured := u.buses[bus]; configured {
+		vendor, vendorParams = busCfg.Vendor, busCfg.VendorParams
+	} else if v, params, found := u.stream.RosterVendor(ctx, bus); found {
+		vendor, vendorParams = v, params
+	} else {
 		return domain.StreamResult{}, false, nil
 	}
 	result, err = u.stream.StartStream(ctx, domain.StreamRequest{
 		Bus:          bus,
 		Cam:          cam,
-		Vendor:       busCfg.Vendor,
+		Vendor:       vendor,
 		Main:         main,
 		Audio:        audio,
-		VendorParams: busCfg.VendorParams,
+		VendorParams: vendorParams,
 	})
 	return result, true, err
 }
