@@ -5,8 +5,8 @@ package castmaster
 import (
 	"context"
 
-	"mediamtx-console/domain"
-	rawclient "mediamtx-console/vendorclients/castmaster"
+	rawclient "media-mtx/castmaster"
+	"media-mtx/domain"
 )
 
 // Config is the per-vendor account block loaded from config/vendors.json.

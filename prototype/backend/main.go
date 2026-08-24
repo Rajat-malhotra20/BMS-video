@@ -4,7 +4,6 @@ import (
 	"context"
 	"errors"
 	"log"
-	"net"
 	"net/http"
 	"net/http/httputil"
 	"net/url"
@@ -16,26 +15,27 @@ import (
 	vendorconfig "mediamtx-console/config"
 	"mediamtx-console/domain"
 	"mediamtx-console/services"
-	"mediamtx-console/vendorclients/n9mserver"
 	"mediamtx-console/vendors"
-	castmasteradapter "mediamtx-console/vendors/castmaster"
 	chemitoapiadapter "mediamtx-console/vendors/chemitoapi"
-	n9madapter "mediamtx-console/vendors/n9m"
 	sumithliveadapter "mediamtx-console/vendors/sumithlive"
 )
 
 type config struct {
-	addr             string
+	addr string
+
+	// mediaMTX* are reverse-proxy targets only: dumb byte pipes so a
+	// browser can play an RTSP-ingested channel through this origin. This
+	// process never calls the MediaMTX API - it asks the media-MTX service
+	// (ingestURL) what is ingesting, and that service owns MediaMTX, the
+	// ffmpeg supervisor, and the N9M device listeners.
 	mediaMTXHLS      string
 	mediaMTXWHEP     string
-	mediaMTXAPI      string
 	mediaMTXPlayback string
-	mediaMTXRTSP     string
-	n9mSignalAddr    string
-	n9mMediaAddr     string
-	corsOrigin       string
-	vendorsConfig    string
-	busesConfig      string
+
+	ingestURL     string
+	corsOrigin    string
+	vendorsConfig string
+	busesConfig   string
 }
 
 func main() {
@@ -43,39 +43,16 @@ func main() {
 		addr:             env("ADDR", ":8080"),
 		mediaMTXHLS:      env("MEDIAMTX_HLS_URL", "http://localhost:8888"),
 		mediaMTXWHEP:     env("MEDIAMTX_WEBRTC_URL", "http://localhost:8889"),
-		mediaMTXAPI:      env("MEDIAMTX_API_URL", "http://localhost:9997/v3"),
 		mediaMTXPlayback: env("MEDIAMTX_PLAYBACK_URL", "http://localhost:9996"),
-		mediaMTXRTSP:     env("MEDIAMTX_RTSP_PUBLISH_URL", "rtsp://localhost:8554"),
-		n9mSignalAddr:    env("N9M_SIGNAL_ADDR", ":9500"),
-		n9mMediaAddr:     env("N9M_MEDIA_ADDR", ":9501"),
-		corsOrigin:       env("CORS_ALLOWED_ORIGIN", "*"),
-		vendorsConfig:    env("VENDORS_CONFIG", "config/vendors.json"),
-		busesConfig:      env("BUSES_CONFIG", "config/buses.json"),
-	}
-
-	// n9mSrv is the Chemito/N9M device server: accepts OBU signaling +
-	// media connections on two ports (see n9mSignalAddr/n9mMediaAddr
-	// below).
-	n9mSrv := n9mserver.NewServer(log.Default())
-	if ln, err := net.Listen("tcp", cfg.n9mSignalAddr); err != nil {
-		log.Printf("n9m: signaling listener disabled: %v", err)
-	} else {
-		log.Printf("n9m signaling listening on %s", cfg.n9mSignalAddr)
-		go func() {
-			if err := n9mSrv.ServeSignaling(ln); err != nil {
-				log.Printf("n9m: signaling listener stopped: %v", err)
-			}
-		}()
-	}
-	if ln, err := net.Listen("tcp", cfg.n9mMediaAddr); err != nil {
-		log.Printf("n9m: media listener disabled: %v", err)
-	} else {
-		log.Printf("n9m media listening on %s", cfg.n9mMediaAddr)
-		go func() {
-			if err := n9mSrv.ServeMedia(ln); err != nil {
-				log.Printf("n9m: media listener stopped: %v", err)
-			}
-		}()
+		// INGEST_URL="" turns the raw-packet side off entirely: no MediaMTX,
+		// no media-mtxd, no ffmpeg. Chemito (HTTP-FLV) and Sumith
+		// (HLS/embed) need none of it, so that is a valid way to run this.
+		// envAllowEmpty, not env: an explicitly empty INGEST_URL must mean
+		// "there is no ingest service", not "unset, use the default".
+		ingestURL:     envAllowEmpty("INGEST_URL", "http://localhost:8090"),
+		corsOrigin:    env("CORS_ALLOWED_ORIGIN", "*"),
+		vendorsConfig: env("VENDORS_CONFIG", "config/vendors.json"),
+		busesConfig:   env("BUSES_CONFIG", "config/buses.json"),
 	}
 
 	mux := http.NewServeMux()
@@ -85,19 +62,26 @@ func main() {
 		_, _ = w.Write([]byte("ok"))
 	})
 
-	mux.Handle("/live/", reverseProxy(cfg.mediaMTXHLS, "/live", noCache))
-	mux.Handle("/whep/", reverseProxy(cfg.mediaMTXWHEP, "/whep", nil))
-	mux.Handle("/mtx-api/", reverseProxy(cfg.mediaMTXAPI, "/mtx-api", nil))
+	// ingestEnabled gates every route that could only ever answer "empty"
+	// without the raw-packet side. With INGEST_URL unset there is no
+	// MediaMTX, so /live /whep /playback have nothing behind them, no
+	// channel is ever RTSP-ingested, and no recording exists. Routing them
+	// anyway would answer 200-with-nothing, which reads as "working, no
+	// data" when the truth is "not part of this deployment" — so they are
+	// not registered and answer 404.
+	ingestEnabled := cfg.ingestURL != ""
 
-	api := newAPIServer(cfg.mediaMTXAPI)
+	api := newAPIServer(cfg.ingestURL)
 	mux.HandleFunc("GET /api/fleet", api.handleFleet)
 	mux.HandleFunc("GET /api/fleet/stream", api.handleFleetStream)
 	mux.HandleFunc("GET /api/bus/{id}", api.handleBusDetail)
 	mux.HandleFunc("GET /api/stream/{id}", api.handleStreamLive)
-	mux.HandleFunc("GET /api/stream/{id}/recording", api.handleStreamRecording)
-	mux.Handle("/playback/", reverseProxy(cfg.mediaMTXPlayback, "/playback", noCache))
-
-	brs := newBridgeServer(cfg.mediaMTXRTSP, n9mSrv)
+	if ingestEnabled {
+		mux.Handle("/live/", reverseProxy(cfg.mediaMTXHLS, "/live", noCache))
+		mux.Handle("/whep/", reverseProxy(cfg.mediaMTXWHEP, "/whep", nil))
+		mux.Handle("/playback/", reverseProxy(cfg.mediaMTXPlayback, "/playback", noCache))
+		mux.HandleFunc("GET /api/stream/{id}/recording", api.handleStreamRecording)
+	}
 
 	// Vendor-less bridge API: the frontend just says "start bus X cam Y"
 	// (see config.Bus) and never names a vendor. Missing config files mean
@@ -112,15 +96,13 @@ func main() {
 		log.Printf("bridge: %v (unified /api/bridge/start has no buses configured)", err)
 		buses = map[string]vendorconfig.Bus{}
 	}
-	castmasterAcct := vendorAccounts["castmaster"]
 	sumithliveAcct := vendorAccounts["sumithlive"]
 	chemitoapiAcct := vendorAccounts["chemitoapi"]
+	// Only vendors that hand back a directly playable URL are registered
+	// here. n9m and castmaster need a remux into a media server, so they
+	// live in the media-MTX service and are reached over HTTP - see
+	// services.IngestClient.
 	registry := vendors.NewRegistry(
-		castmasteradapter.New(castmasteradapter.Config{
-			BaseURL:  castmasterAcct.BaseURL,
-			Username: castmasterAcct.Username,
-			Password: castmasterAcct.Password,
-		}),
 		sumithliveadapter.New(sumithliveadapter.Config{
 			BaseURL:          sumithliveAcct.BaseURL,
 			Username:         sumithliveAcct.Username,
@@ -132,13 +114,13 @@ func main() {
 			Username: chemitoapiAcct.Username,
 			Password: chemitoapiAcct.Password,
 		}),
-		n9madapter.New(n9mSrv),
 	)
-	streamSvc := &services.StreamService{
-		Registry:       registry,
-		Supervisor:     brs.supervisor,
-		RTSPPublish:    cfg.mediaMTXRTSP,
-		RestartBackoff: brs.restartBackoff,
+	streamSvc := &services.StreamService{Registry: registry}
+	if cfg.ingestURL != "" {
+		streamSvc.Ingest = services.NewIngestClient(cfg.ingestURL)
+	} else {
+		log.Printf("no ingest service configured (INGEST_URL empty): " +
+			"serving only vendors that need no media server")
 	}
 	ubrs := newUnifiedBridgeServer(streamSvc, buses)
 
@@ -165,38 +147,53 @@ func main() {
 	// below for admin/debug and as what this hook calls under the hood).
 	api.ensureStream = ubrs.ensureStream
 
+	// Vendor HTTP-FLV byte pipe for KindFLV sources (Chemito): the page
+	// plays this path with mpegts.js. Not MediaMTX — see handleFLVProxy.
+	mux.HandleFunc("GET /api/flv/{key}", ubrs.handleFLVProxy)
+
 	mux.HandleFunc("POST /api/bridge/start", ubrs.handleStart)
+	// POST stop stays either way: it also drops a tracked direct (FLV/HLS)
+	// session, which exists with no ingest side at all. GET /api/bridge
+	// lists ingest remux jobs only, so it is empty by construction here.
 	mux.HandleFunc("POST /api/bridge/stop", ubrs.handleStop)
-	mux.HandleFunc("GET /api/bridge", ubrs.handleList)
+	if ingestEnabled {
+		mux.HandleFunc("GET /api/bridge", ubrs.handleList)
+	}
 
-	// Admin/debug only — direct per-vendor calls. Not for frontend use, so
-	// they're kept off the "/" endpoint listing; still routed for
-	// debugging one vendor in isolation and for looking up device ids
-	// (e.g. GET /api/bridge/n9m/devices) to put into config/buses.json.
-	// Jobs started this way still show up in GET /api/bridge and stop via
-	// POST /api/bridge/stop above — same underlying Supervisor.
-	mux.HandleFunc("POST /api/bridge/castmaster/start", brs.handleCastmasterStart)
-	mux.HandleFunc("POST /api/bridge/n9m/start", brs.handleN9mStart)
-	mux.HandleFunc("POST /api/bridge/sumithlive/start", brs.handleSumithLiveStart)
-	mux.HandleFunc("GET /api/bridge/sumithlive/vehicles", brs.handleSumithLiveVehicles)
-	mux.HandleFunc("GET /api/bridge/n9m/devices", brs.handleN9mDevices)
+	// Admin/debug only - direct per-vendor calls with credentials in the
+	// request, kept off the "/" endpoint listing. The castmaster/n9m
+	// equivalents moved to the media-MTX service (POST /start there).
+	mux.HandleFunc("POST /api/bridge/sumithlive/start", handleSumithLiveStart)
+	mux.HandleFunc("GET /api/bridge/sumithlive/vehicles", handleSumithLiveVehicles)
 
-	mux.HandleFunc("/", func(w http.ResponseWriter, _ *http.Request) {
-		// Frontend-facing only. The per-vendor /api/bridge/{castmaster,n9m,
-		// sumithlive}/... routes above still work but are admin/debug —
-		// left off this listing on purpose.
-		writeJSON(w, map[string]any{
-			"service": "fleet-bms-api",
-			"endpoints": []string{
-				"GET /api/fleet",
-				"GET /api/fleet/stream",
-				"GET /api/bus/{id}",
-				"GET /api/stream/{id}",
+	mux.HandleFunc("/", func(w http.ResponseWriter, r *http.Request) {
+		// "/" in Go's ServeMux is a catch-all, so without this every
+		// unmatched path — a typo, or a route deliberately not registered
+		// because this deployment has no ingest side — answered 200 with
+		// the endpoint listing. That looks like success to a caller.
+		if r.URL.Path != "/" {
+			http.NotFound(w, r)
+			return
+		}
+		// Frontend-facing only. The per-vendor /api/bridge/sumithlive/...
+		// routes above still work but are admin/debug - left off this
+		// listing on purpose.
+		endpoints := []string{
+			"GET /api/fleet",
+			"GET /api/fleet/stream",
+			"GET /api/bus/{id}",
+			"GET /api/stream/{id}",
+			"POST /api/bridge/stop?key=",
+			"GET /health",
+		}
+		if ingestEnabled {
+			endpoints = append(endpoints,
 				"GET /api/stream/{id}/recording?from=&to=",
-				"POST /api/bridge/stop?key=",
-				"GET /api/bridge",
-				"GET /health",
-			},
+				"GET /api/bridge")
+		}
+		writeJSON(w, map[string]any{
+			"service":   "fleet-bms-api",
+			"endpoints": endpoints,
 		})
 	})
 
@@ -282,6 +279,18 @@ func runStartupAutoStart(streamSvc *services.StreamService, buses map[string]ven
 
 	wg.Wait()
 	log.Printf("startup-auto-start: done")
+}
+
+// envAllowEmpty is env() but honors a variable that is set to an empty
+// string instead of falling back. The distinction matters for INGEST_URL:
+// empty means "there is no ingest service", a real configuration rather
+// than an omission, and silently substituting a default there produces a
+// process that retries something deliberately not running.
+func envAllowEmpty(key, fallback string) string {
+	if v, ok := os.LookupEnv(key); ok {
+		return strings.TrimSpace(v)
+	}
+	return fallback
 }
 
 func env(key, fallback string) string {

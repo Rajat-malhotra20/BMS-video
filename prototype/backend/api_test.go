@@ -10,15 +10,11 @@ import (
 )
 
 func TestFleetHandler(t *testing.T) {
-	mtx := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-		page := r.URL.Query().Get("page")
-		w.Header().Set("Content-Type", "application/json")
-		if page == "" || page == "0" {
-			fmt.Fprint(w, `{"pageCount":2,"items":[{"name":"DL1PC0001_1","ready":true},{"name":"DL1PC0001_2","ready":true}]}`)
-		} else {
-			fmt.Fprint(w, `{"pageCount":2,"items":[{"name":"DL1PC0002_1","ready":true}]}`)
-		}
-	}))
+	mtx := fakeIngest(`[
+		{"name":"DL1PC0001_1","ready":true},
+		{"name":"DL1PC0001_2","ready":true},
+		{"name":"DL1PC0002_1","ready":true}
+	]`)
 	defer mtx.Close()
 
 	api := newAPIServer(mtx.URL)
@@ -38,9 +34,12 @@ func TestFleetHandler(t *testing.T) {
 	}
 }
 
-// TestFleetHandlerMtxDown verifies that handleFleet returns 502 when MediaMTX
-// is unreachable (closed server → connection refused).
-func TestFleetHandlerMtxDown(t *testing.T) {
+// A dead ingest service must NOT fail the fleet. It used to (502), back when
+// every camera was remuxed through MediaMTX and no paths meant no fleet.
+// That is no longer true: Chemito (HTTP-FLV) and Sumith (HLS/embed) never
+// touch a media server, so a deployment can run with no MediaMTX and no
+// media-mtxd at all. Failing here would blank a fleet that is entirely fine.
+func TestFleetHandlerIngestDown(t *testing.T) {
 	// Start then immediately close a server so its URL is valid but unreachable.
 	closed := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {}))
 	closedURL := closed.URL
@@ -51,20 +50,37 @@ func TestFleetHandlerMtxDown(t *testing.T) {
 	rec := httptest.NewRecorder()
 	api.handleFleet(rec, req)
 
-	if rec.Code != http.StatusBadGateway {
-		t.Fatalf("status = %d, want 502 Bad Gateway", rec.Code)
+	if rec.Code != http.StatusOK {
+		t.Fatalf("status = %d, want 200 (degraded, not failed)", rec.Code)
+	}
+	var got fleetSummary
+	if err := json.Unmarshal(rec.Body.Bytes(), &got); err != nil {
+		t.Fatalf("bad json: %v", err)
+	}
+	if got.Totals.CamsOnline != 0 {
+		t.Fatalf("camsOnline = %d, want 0 with nothing ingesting", got.Totals.CamsOnline)
+	}
+}
+
+// The same again with no ingest service configured at all (INGEST_URL=""),
+// which is how a MediaMTX-free deployment is meant to be run: no attempt, no
+// log noise, still a working fleet.
+func TestFleetHandlerNoIngestConfigured(t *testing.T) {
+	api := newAPIServer("")
+	req := httptest.NewRequest("GET", "/api/fleet", nil)
+	rec := httptest.NewRecorder()
+	api.handleFleet(rec, req)
+
+	if rec.Code != http.StatusOK {
+		t.Fatalf("status = %d, want 200", rec.Code)
+	}
+	if api.ingest != nil {
+		t.Error("ingest client built for an empty base URL; want none")
 	}
 }
 
 func TestBusDetailHandler(t *testing.T) {
-	mtx := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-		w.Header().Set("Content-Type", "application/json")
-		fmt.Fprint(w, `{"pageCount":1,"items":[
-			{"name":"DL1PC0001_1","ready":true,"tracks":["H264"],"bytesReceived":1000},
-			{"name":"DL1PC0001_2","ready":true,"tracks":["H264"],"bytesReceived":2000},
-			{"name":"DL1PC0002_1","ready":true}
-		]}`)
-	}))
+	mtx := streamTestMtx()
 	defer mtx.Close()
 
 	api := newAPIServer(mtx.URL)
@@ -88,15 +104,26 @@ func TestBusDetailHandler(t *testing.T) {
 	}
 }
 
-func streamTestMtx() *httptest.Server {
+// fakeIngest stands in for the media-MTX service: GET /paths returning a
+// flat array. This API no longer speaks to MediaMTX, so there is no paged
+// {"pageCount":N,"items":[...]} envelope to emulate any more.
+func fakeIngest(pathsJSON string) *httptest.Server {
 	return httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if r.URL.Path != "/paths" {
+			http.NotFound(w, r)
+			return
+		}
 		w.Header().Set("Content-Type", "application/json")
-		fmt.Fprint(w, `{"pageCount":1,"items":[
-			{"name":"DL1PC0001_1","ready":true,"tracks":["H264"],"bytesReceived":1000},
-			{"name":"DL1PC0001_2","ready":true,"tracks":["H264"],"bytesReceived":2000},
-			{"name":"DL1PC0002_1","ready":true}
-		]}`)
+		fmt.Fprint(w, pathsJSON)
 	}))
+}
+
+func streamTestMtx() *httptest.Server {
+	return fakeIngest(`[
+		{"name":"DL1PC0001_1","ready":true,"tracks":["H264"],"bytesReceived":1000},
+		{"name":"DL1PC0001_2","ready":true,"tracks":["H264"],"bytesReceived":2000},
+		{"name":"DL1PC0002_1","ready":true}
+	]`)
 }
 
 func TestStreamLiveHandler_AllCams(t *testing.T) {

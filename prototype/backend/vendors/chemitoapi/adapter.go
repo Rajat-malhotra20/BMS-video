@@ -7,22 +7,10 @@ package chemitoapi
 
 import (
 	"context"
-	"time"
 
 	"mediamtx-console/domain"
-	"mediamtx-console/vendorclients/bridge"
 	rawclient "mediamtx-console/vendorclients/chemitoapi"
 )
-
-// restartBackoff is Chemito's own initial reconnect delay, shorter than the
-// service's general-purpose default. Confirmed live 2026-08-20: this
-// vendor's feed normally connects, streams a brief burst, then ends
-// cleanly by itself — not a failure, just how its session lifetime works —
-// so treating every reconnect like recovering from an error (the default
-// backoff floor) made it feel broken when it wasn't. Exponential growth and
-// the give-up cooldown (see vendorclients/bridge/supervisor.go) still apply
-// on top of this for a channel that's genuinely stuck.
-const restartBackoff = 2 * time.Second
 
 // Config is the per-vendor block loaded from config/vendors.go.
 type Config struct {
@@ -37,18 +25,25 @@ func New(cfg Config) *Adapter { return &Adapter{cfg: cfg} }
 
 func (a *Adapter) Name() string { return "chemitoapi" }
 
-// ResolveLiveSource hands back a Run that logs in, resolves an available
+// ResolveLiveSource returns KindFLV: the vendor's HTTP-FLV live stream,
+// played directly in the browser by mpegts.js behind our /api/flv/{key}
+// proxy — no ffmpeg, no MediaMTX. Upstream logs in, resolves an available
 // relay port (§4 of the doc's operation steps — "Get video port
-// information" then "Get device list"), and requests the FLV live-video URL
-// fresh on every Supervisor attempt — always KindRTSP, since Chemito hands
-// back a raw stream URL to remux, same as castmaster.
+// information" then "Get device list"), and requests the FLV URL fresh on
+// every viewer connect.
 //
-// This must re-resolve every retry, not just the first: confirmed live
+// This used to be KindRTSP (ffmpeg remux into MediaMTX). Dropped because
+// MediaMTX's RTSP muxer rejects Chemito's non-monotonic DTS (it reports 0
+// repeatedly) with "Error submitting a packet to the muxer: Broken pipe",
+// and since every channel of one device carries the same defect they all
+// got dropped at the same moment — the real cause behind "all cams vanish
+// together". mpegts.js does its own timestamp remapping, so the defect
+// stops mattering. Bypassing the remux also means channels no longer
+// compete for ffmpeg processes or share a publisher's fate.
+//
+// Upstream must re-resolve per connect, not freeze one URL: confirmed live
 // 2026-08-19 that Chemito's login token / live-video URL is single-use or
-// short-lived — freezing one URL into the remux job (as this used to) means
-// every Supervisor retry re-execs ffmpeg against the exact same now-stale
-// request, failing identically forever instead of getting a fresh chance.
-// Same reasoning as N9M's Run (see domain.RemuxInput doc).
+// short-lived, so a cached URL is already dead for the next viewer.
 //
 // The device's own "transmitport" field (from ListDevices) is NOT a
 // connectable stream port — confirmed live 2026-08-19: connecting to it
@@ -65,33 +60,31 @@ func (a *Adapter) ResolveLiveSource(ctx context.Context, req domain.StreamReques
 	if req.Main {
 		st = rawclient.LiveStreamMain
 	}
-	rtspOut := req.RTSPOut
 
-	run := func(ctx context.Context) error {
+	upstream := func(ctx context.Context) (string, error) {
 		client := rawclient.NewClient(a.cfg.BaseURL, nil)
 		if _, err := client.Login(a.cfg.Username, a.cfg.Password); err != nil {
-			return domain.WrapVendorErr("chemitoapi", "login", err)
+			return "", domain.WrapVendorErr("chemitoapi", "login", err)
 		}
 
 		ports, err := client.LivePorts()
 		if err != nil {
-			return domain.WrapVendorErr("chemitoapi", "list live ports", err)
+			return "", domain.WrapVendorErr("chemitoapi", "list live ports", err)
 		}
 		if len(ports) == 0 {
-			return &domain.VendorError{
+			return "", &domain.VendorError{
 				Vendor: "chemitoapi", Op: "resolve live source", Code: "no_live_ports", Retryable: true,
 			}
 		}
 
 		url, err := client.LiveVideoURL(terid, channel, req.Audio, st, ports[0].Port)
 		if err != nil {
-			return domain.WrapVendorErr("chemitoapi", "resolve live video url", err)
+			return "", domain.WrapVendorErr("chemitoapi", "resolve live video url", err)
 		}
-
-		return bridge.RemuxToRTSP(url, rtspOut)(ctx)
+		return url, nil
 	}
 
-	return domain.LiveSource{Kind: domain.KindRTSP, Remux: domain.RemuxInput{Run: run}, RestartBackoff: restartBackoff}, nil
+	return domain.LiveSource{Kind: domain.KindFLV, Upstream: upstream, HasAudio: req.Audio}, nil
 }
 
 // ListCameras returns every device registered on this account, via the

@@ -12,10 +12,10 @@ import (
 	"strconv"
 	"time"
 
-	"mediamtx-console/domain"
-	"mediamtx-console/vendorclients/bridge"
-	rawclient "mediamtx-console/vendorclients/n9m"
-	"mediamtx-console/vendorclients/n9mserver"
+	"media-mtx/bridge"
+	"media-mtx/domain"
+	rawclient "media-mtx/n9m"
+	"media-mtx/n9mserver"
 )
 
 type Adapter struct {

@@ -6,7 +6,7 @@ import (
 	"testing"
 	"time"
 
-	"mediamtx-console/vendorclients/n9m"
+	"media-mtx/n9m"
 )
 
 type testLogger struct{ t *testing.T }

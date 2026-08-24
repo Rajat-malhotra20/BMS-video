@@ -1,0 +1,11 @@
+# Overlay that runs the fleet API alone — no MediaMTX, no media-mtxd.
+#
+#   docker compose -f docker-compose.yml -f docker-compose.no-mediamtx.yml up -d
+#
+# Chemito (HTTP-FLV) and Sumith (HLS/embed) work fully. n9m and castmaster
+# buses do not appear, because they are the only ones needing a remux.
+services:
+  app:
+    # entrypoint, not command: the Dockerfile ENTRYPOINT is exec-form, so a
+    # command here would be appended as extra args rather than replacing it.
+    entrypoint: ["supervisord", "-c", "/etc/supervisord.no-mediamtx.conf"]

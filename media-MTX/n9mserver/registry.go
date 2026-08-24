@@ -9,7 +9,7 @@ import (
 	"sync"
 	"time"
 
-	"mediamtx-console/vendorclients/n9m"
+	"media-mtx/n9m"
 )
 
 // DeviceSession is one connected device's signaling channel plus metadata

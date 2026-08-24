@@ -23,6 +23,12 @@ type job struct {
 	mu       sync.Mutex
 	lastErr  error
 	attempts int
+	// runningSince is when the current attempt started, zero while sleeping
+	// between attempts. Without this, Status can only report lastErr — which
+	// is whatever the *previous* attempt failed with, even for a job that has
+	// been streaming happily for an hour since. That made a healthy fleet
+	// read as broken on every /api/bridge check.
+	runningSince time.Time
 }
 
 // Supervisor runs a set of named RunFuncs, restarting each with backoff until
@@ -47,12 +53,27 @@ func (e *ErrAlreadyRunning) Error() string {
 // maxBackoff caps the exponential backoff below so a permanently failing
 // job (e.g. a vendor channel that isn't wired to a real camera) settles
 // down to one attempt every 5 minutes rather than hammering the vendor
-// forever at the initial rate. There's no reset-on-success heuristic here:
-// a vendor timeout (itself often 30s+) is indistinguishable by duration
-// alone from a genuine connect, so backoff only ever grows for a job's
-// lifetime — cheap insurance against hammering a vendor, at the cost of a
-// flaky-but-working stream retrying slower after its first drop.
+// forever at the initial rate.
 const maxBackoff = 5 * time.Minute
+
+// healthyRun is how long one attempt must last to count as "this actually
+// worked" and reset the backoff. Anything shorter is a failed connect and
+// keeps escalating.
+//
+// There used to be no reset-on-success at all, on the theory that a vendor
+// timeout is indistinguishable by duration from a genuine connect. It isn't:
+// the vendor HTTP clients here time out at 15s, while a real feed streams for
+// minutes (confirmed live 2026-08-20 — 40-75MB received per channel). Without
+// a reset, a stream that worked for 20 minutes and dropped once still got the
+// full escalation, and after three max-outs went dark for giveUpCooldown — an
+// hour of nothing for a feed that was fine. Worse, every channel of one device
+// starts together at boot and fails together (they share the device's
+// defects), so their backoffs stayed in lockstep and the whole bus went dark
+// at the same moment.
+//
+// A var, not a const, only so the test can shrink it rather than sleep a real
+// minute.
+var healthyRun = 60 * time.Second
 
 // giveUpAfterMaxouts / giveUpCooldown: some vendor devices have no way to
 // release a session once opened (Chemito's API has no stop/close call), so
@@ -85,14 +106,29 @@ func (s *Supervisor) Start(key string, run RunFunc, initialBackoff time.Duration
 		backoff := initialBackoff
 		consecutiveMaxouts := 0
 		for {
-			err := run(ctx)
+			startedAt := time.Now()
 			j.mu.Lock()
+			j.runningSince = startedAt
+			j.mu.Unlock()
+
+			err := run(ctx)
+
+			ranFor := time.Since(startedAt)
+			j.mu.Lock()
+			j.runningSince = time.Time{}
 			j.lastErr = err
 			j.attempts++
 			j.mu.Unlock()
 
 			if ctx.Err() != nil {
 				return
+			}
+
+			// The attempt streamed long enough to count as working, so this
+			// drop is a fresh incident, not a continuing losing streak.
+			if ranFor >= healthyRun {
+				backoff = initialBackoff
+				consecutiveMaxouts = 0
 			}
 
 			sleepFor := backoff
@@ -199,10 +235,18 @@ func (s *Supervisor) Running(key string) bool {
 }
 
 // Status summarizes one job's state for observability endpoints.
+//
+// Streaming/UptimeSeconds exist because LastErr alone is actively
+// misleading: it holds whatever the *previous* attempt failed with and is
+// never cleared, so a channel that has been publishing for an hour still
+// reports a scary error. Read Streaming first — LastErr is history, not
+// current state.
 type Status struct {
-	Key      string `json:"key"`
-	Attempts int    `json:"attempts"`
-	LastErr  string `json:"lastError,omitempty"`
+	Key           string `json:"key"`
+	Attempts      int    `json:"attempts"`
+	Streaming     bool   `json:"streaming"`
+	UptimeSeconds int    `json:"uptimeSeconds,omitempty"`
+	LastErr       string `json:"lastError,omitempty"`
 }
 
 // List returns a status snapshot for every active job, ordered arbitrarily.
@@ -213,6 +257,10 @@ func (s *Supervisor) List() []Status {
 	for key, j := range s.jobs {
 		j.mu.Lock()
 		st := Status{Key: key, Attempts: j.attempts}
+		if !j.runningSince.IsZero() {
+			st.Streaming = true
+			st.UptimeSeconds = int(time.Since(j.runningSince).Seconds())
+		}
 		if j.lastErr != nil {
 			st.LastErr = j.lastErr.Error()
 		}

@@ -1,0 +1,94 @@
+<!doctype html>
+<meta charset="utf-8">
+<title>Chemito FLV grid</title>
+<!-- Why this page exists: /api/flv/{key} serves video/x-flv, which no
+     browser plays natively — open it directly and you get a download, not a
+     picture. mpegts.js fetches it via XHR and feeds Media Source Extensions,
+     which is what turns those bytes into video. -->
+<script src="https://cdn.jsdelivr.net/npm/mpegts.js@1.7.3/dist/mpegts.js"></script>
+<style>
+  body { font: 14px system-ui; background:#111; color:#eee; margin:16px }
+  #grid { display:grid; grid-template-columns:repeat(auto-fit,minmax(360px,1fr)); gap:12px }
+  figure { margin:0; background:#000; border:1px solid #333; border-radius:6px; overflow:hidden }
+  video { width:100%; aspect-ratio:16/9; background:#000; display:block }
+  figcaption { padding:6px 8px; font-size:12px; display:flex; justify-content:space-between }
+  .err { color:#f66 }
+  input { font:inherit; padding:4px 8px; width:220px }
+</style>
+<p>
+  <label>bus <input id="bus" value="DLPD8611"></label>
+  <button id="go">load</button>
+  <span id="status"></span>
+</p>
+<div id="grid"></div>
+<script>
+const API = "http://127.0.0.1:4000";
+const players = [];
+
+async function load() {
+  players.forEach(p => p.destroy());
+  players.length = 0;
+  grid.innerHTML = "";
+  const bus = document.getElementById("bus").value.trim();
+  status.textContent = "resolving…";
+
+  // One call gets the whole bundle — every cam the backend has for this bus.
+  const cams = await fetch(`${API}/api/stream/${bus}`).then(r => r.json());
+  status.textContent = `${cams.length} cam(s)`;
+
+  for (const c of cams) {
+    const fig = document.createElement("figure");
+    const video = document.createElement("video");
+    video.muted = true; video.autoplay = true; video.controls = true;
+    const cap = document.createElement("figcaption");
+    cap.innerHTML = `<span>cam ${c.cam} · ${c.kind || "mediamtx"}</span><span></span>`;
+    fig.append(video, cap);
+    grid.append(fig);
+    play(c, video, cap.lastElementChild);
+  }
+}
+
+function play(c, video, note, attempt = 0) {
+  if (c.kind === "flv") {
+    if (!mpegts.isSupported()) { note.textContent = "MSE unsupported"; return; }
+    const p = mpegts.createPlayer({ type: "flv", isLive: true, url: API + c.directUrl },
+                                  { liveBufferLatencyChasing: true });
+    p.attachMediaElement(video);
+    p.load();
+    p.play().catch(() => {});
+    // Chemito's token is single-use, so a reconnect must re-request the
+    // proxy path (which re-resolves server-side) rather than resume.
+    //
+    // Backoff is not politeness, it's necessary: Chemito cannot close a
+    // session, so every reconnect leaves another phantom one open. A flat
+    // 2s retry across 4 channels took a healthy device down to HTTP 408 on
+    // every channel (observed 2026-08-24). The server enforces its own
+    // cooldown too — this just avoids pointlessly hitting it.
+    p.on(mpegts.Events.ERROR, (t, d) => {
+      p.destroy();
+      if (attempt >= 6) {
+        note.innerHTML = `<span class="err">${t}/${d} — gave up</span>`;
+        return;
+      }
+      const wait = Math.min(30000, 3000 * 2 ** attempt);
+      note.innerHTML = `<span class="err">${t}/${d} — retry in ${wait / 1000}s</span>`;
+      setTimeout(() => play(c, video, note, attempt + 1), wait);
+    });
+    // MEDIA_INFO only fires once the decoder actually initialized — the
+    // exact thing the FLV audio-flag lie used to prevent.
+    p.on(mpegts.Events.MEDIA_INFO, (mi) => {
+      note.textContent = `live · ${mi.videoCodec || ""} ${mi.width || "?"}x${mi.height || "?"}`;
+    });
+    players.push(p);
+  } else if (c.kind === "hls") {
+    video.src = c.directUrl;              // Sumith serves a real .m3u8
+  } else if (c.kind === "embed") {
+    note.textContent = "embed-only (iframe)";
+  } else {
+    video.src = API + c.hlsUrl;           // MediaMTX ingest (n9m/castmaster)
+  }
+}
+
+document.getElementById("go").onclick = load;
+load();
+</script>

@@ -8,8 +8,12 @@ import (
 	"time"
 )
 
-// mtxPath is the subset of MediaMTX /v3/paths/list items we need.
-type mtxPath struct {
+// ingestPath is one channel the media-MTX service reports as ingesting
+// (GET /paths on media-MTX/cmd/media-mtxd), plus the synthetic entries
+// directPaths adds for buses that never touch a media server at all. This
+// API deliberately holds no MediaMTX knowledge of its own — the field set
+// happens to match MediaMTX's because that service is the only producer.
+type ingestPath struct {
 	Name          string   `json:"name"`
 	Ready         bool     `json:"ready"`
 	Tracks        []string `json:"tracks"`
@@ -19,10 +23,10 @@ type mtxPath struct {
 	} `json:"readers"`
 
 	// DirectKind/DirectURL are set on a synthetic entry from
-	// apiServer.directPaths — a bus live via a non-RTSP vendor result
-	// ("embed" or "hls"), no MediaMTX ingest at all. Empty for a real
-	// MediaMTX path; never set by MediaMTX itself, JSON-ignored since
-	// neither ever appears in the real /paths/list response.
+	// apiServer.directPaths — a bus live via a directly playable vendor
+	// result ("flv", "hls" or "embed"), with no media-server ingest at all.
+	// Empty for a real ingest path, and JSON-ignored since neither ever
+	// appears in the ingest service's own response.
 	DirectKind string `json:"-"`
 	DirectURL  string `json:"-"`
 }
@@ -80,7 +84,7 @@ func newFleetTracker() *fleetTracker {
 	return &fleetTracker{lastSeen: make(map[string]time.Time)}
 }
 
-func (t *fleetTracker) build(paths []mtxPath, now time.Time) fleetSummary {
+func (t *fleetTracker) build(paths []ingestPath, now time.Time) fleetSummary {
 	t.mu.Lock()
 	defer t.mu.Unlock()
 

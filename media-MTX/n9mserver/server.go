@@ -7,7 +7,7 @@ import (
 	"net"
 	"time"
 
-	"mediamtx-console/vendorclients/n9m"
+	"media-mtx/n9m"
 )
 
 // handshakeTimeout bounds how long a freshly-accepted connection has to send

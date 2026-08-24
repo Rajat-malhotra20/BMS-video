@@ -83,8 +83,25 @@ func RemuxToRTSP(sourceURL, rtspOut string) RunFunc {
 	return func(ctx context.Context) error {
 		return runFFmpeg(ctx,
 			"-hide_banner", "-loglevel", "warning", "-y",
+			// Exit rather than block forever on a stalled upstream. Without
+			// this, a TCP connection that stops delivering frames but never
+			// closes (seen on Chemito) leaves ffmpeg alive and publishing
+			// nothing: the MediaMTX path goes not-ready, but run() never
+			// returns, so Supervisor believes the job is healthy and never
+			// retries. Generous vs. a live feed's real frame gaps (~30KB/s
+			// continuous, confirmed live 2026-08-20).
+			"-rw_timeout", "15000000", // µs
+			// Rebuild timestamps from wall clock instead of trusting the
+			// source's. Chemito's FLV reports non-monotonic DTS (repeatedly
+			// 0), which -c copy passes straight through to the RTSP muxer;
+			// MediaMTX then drops the publisher ("Error submitting a packet
+			// to the muxer: Broken pipe"). Every channel of a device carries
+			// the same defect, so they all get dropped at once — the real
+			// cause behind "all cams vanish together".
+			"-use_wallclock_as_timestamps", "1",
 			"-i", sourceURL,
 			"-c", "copy",
+			"-avoid_negative_ts", "make_zero",
 			"-f", "rtsp", "-rtsp_transport", "tcp",
 			rtspOut,
 		)

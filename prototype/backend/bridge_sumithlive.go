@@ -11,7 +11,11 @@ import (
 // this has no ffmpeg/MediaMTX step: the vendor's own doc never reveals what
 // stream protocol the returned jspLink page uses internally, so there's
 // nothing to remux — we just hand the embeddable page URL back to the
-// frontend to load in an iframe.
+// frontend to load in an iframe. (Vendors that DO need a remux live in the
+// media-MTX service instead; see its cmd/media-mtxd.)
+//
+// Admin/debug only: these two take raw credentials in the request, unlike
+// the normal GET /api/stream path which uses the configured account.
 type sumithLiveRequest struct {
 	BaseURL   string `json:"baseUrl"` // optional, defaults to https://trakzee2.uffizio.com
 	Username  string `json:"username"`
@@ -27,7 +31,7 @@ type sumithLiveResponse struct {
 
 // handleSumithLiveStart logs into Sumith/Trakzee and resolves the
 // embeddable live-video page URL for one vehicle/channel.
-func (b *bridgeServer) handleSumithLiveStart(w http.ResponseWriter, r *http.Request) {
+func handleSumithLiveStart(w http.ResponseWriter, r *http.Request) {
 	var req sumithLiveRequest
 	if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
 		http.Error(w, "invalid JSON body: "+err.Error(), http.StatusBadRequest)
@@ -56,7 +60,7 @@ func (b *bridgeServer) handleSumithLiveStart(w http.ResponseWriter, r *http.Requ
 
 // handleSumithLiveVehicles lists the plates visible to this account, so the
 // frontend can populate a picker instead of needing a plate typed in blind.
-func (b *bridgeServer) handleSumithLiveVehicles(w http.ResponseWriter, r *http.Request) {
+func handleSumithLiveVehicles(w http.ResponseWriter, r *http.Request) {
 	username, password := r.URL.Query().Get("username"), r.URL.Query().Get("password")
 	if username == "" || password == "" {
 		http.Error(w, "username and password query params are required", http.StatusBadRequest)

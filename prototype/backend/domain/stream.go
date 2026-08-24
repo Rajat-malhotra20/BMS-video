@@ -14,6 +14,7 @@ const (
 	KindRTSP  SourceKind = "rtsp"  // needs a remux job; played back via MediaMTX
 	KindEmbed SourceKind = "embed" // opaque URL; frontend iframes it directly
 	KindHLS   SourceKind = "hls"   // direct, CORS-open .m3u8 playlist; frontend plays it straight, no remux/iframe
+	KindFLV   SourceKind = "flv"   // vendor HTTP-FLV, proxied by us; frontend plays it with mpegts.js, no remux
 )
 
 // LiveSource is what every vendor adapter must resolve a request into.
@@ -23,7 +24,28 @@ type LiveSource struct {
 	Remux RemuxInput // set when Kind == KindRTSP
 
 	EmbedURL string // set when Kind == KindEmbed
-	HLSURL   string // set when Kind == KindHLS
+
+	// HLSURL is the direct playable URL handed to the frontend: the
+	// vendor's own .m3u8 for KindHLS, or our /api/flv/{key} proxy path for
+	// KindFLV. Named for its first (and still most common) use rather than
+	// renamed across every caller when FLV was added.
+	HLSURL string // set when Kind == KindHLS or KindFLV
+
+	// Upstream, set when Kind == KindFLV, resolves a fresh vendor stream
+	// URL each time a viewer connects to the proxy. It must re-resolve
+	// rather than return a frozen URL for the same reason RemuxInput.Run
+	// re-negotiates per attempt: Chemito's login token / live-video URL is
+	// single-use or short-lived, so one cached URL is dead by the second
+	// viewer. Nothing about the vendor call leaves the server this way —
+	// the browser only ever sees our proxy path.
+	Upstream func(ctx context.Context) (string, error)
+
+	// HasAudio, for KindFLV, is whether audio was actually requested from
+	// the vendor. Chemito advertises audio in its FLV header even when
+	// asked for audio=0 and then sends no audio tags at all, which stalls
+	// any player that believes the header — so the proxy corrects the flag
+	// and needs to know the truth. See handleFLVProxy.
+	HasAudio bool
 
 	// RestartBackoff, if nonzero, overrides the service's default initial
 	// backoff for this RTSP job's Supervisor retries. Only the adapter

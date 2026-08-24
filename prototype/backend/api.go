@@ -17,9 +17,12 @@ import (
 )
 
 type apiServer struct {
-	mtxAPIBase string // e.g. http://mediamtx:9997/v3
-	tracker    *fleetTracker
-	client     *http.Client
+	// ingest is this API's only link to the media-MTX service, and
+	// therefore the only way it learns what is ingesting. There is no
+	// MediaMTX address, client, or paging logic in this process any more —
+	// see services.IngestClient.
+	ingest  *services.IngestClient
+	tracker *fleetTracker
 
 	// directKeys, if set, returns {bus}_{cam} keys currently live via a
 	// non-RTSP vendor result (embed or direct HLS) — never in MediaMTX, so
@@ -48,7 +51,7 @@ type apiServer struct {
 
 	cacheMu     sync.Mutex
 	cachedFleet *fleetSummary
-	cachedPaths []mtxPath
+	cachedPaths []ingestPath
 	cachedAt    time.Time
 	refreshing  bool
 	refreshDone chan struct{}
@@ -57,66 +60,38 @@ type apiServer struct {
 
 const fleetCacheTTL = 2 * time.Second
 
-func newAPIServer(mtxAPIBase string) *apiServer {
-	return &apiServer{
-		mtxAPIBase: mtxAPIBase,
-		tracker:    newFleetTracker(),
-		client:     &http.Client{Timeout: 5 * time.Second},
+// newAPIServer wires the API to the media-MTX service at ingestBase
+// (e.g. http://127.0.0.1:8090). An empty ingestBase means there is no
+// ingest service at all: a deployment that runs neither MediaMTX nor
+// media-mtxd, serving only vendors that need no media server (Chemito
+// HTTP-FLV, Sumith HLS/embed). That is a supported configuration, not a
+// broken one, so nothing here treats a missing ingest side as fatal.
+func newAPIServer(ingestBase string) *apiServer {
+	a := &apiServer{tracker: newFleetTracker()}
+	if ingestBase != "" {
+		a.ingest = services.NewIngestClient(ingestBase)
 	}
-}
-
-type mtxPathList struct {
-	PageCount int       `json:"pageCount"`
-	Items     []mtxPath `json:"items"`
-}
-
-// fetchAllPaths pages through MediaMTX /paths/list.
-func (a *apiServer) fetchAllPaths() ([]mtxPath, error) {
-	var all []mtxPath
-	for page := 0; ; page++ {
-		url := fmt.Sprintf("%s/paths/list?itemsPerPage=500&page=%d", a.mtxAPIBase, page)
-		resp, err := a.client.Get(url)
-		if err != nil {
-			return nil, err
-		}
-		// Issue 2: check HTTP status before decoding.
-		if resp.StatusCode != http.StatusOK {
-			resp.Body.Close()
-			return nil, fmt.Errorf("mediamtx returned HTTP %d for %s", resp.StatusCode, url)
-		}
-		var list mtxPathList
-		err = json.NewDecoder(resp.Body).Decode(&list)
-		resp.Body.Close()
-		if err != nil {
-			return nil, err
-		}
-		all = append(all, list.Items...)
-		// Issue 3: guard against pageCount == 0 to avoid integer underflow.
-		if list.PageCount == 0 || page >= list.PageCount-1 {
-			break
-		}
-	}
-	return all, nil
+	return a
 }
 
 // directPaths turns currently-active non-RTSP vendor sessions into
-// synthetic mtxPath entries (Ready=true, no tracks/bytes) so
+// synthetic ingestPath entries (Ready=true, no tracks/bytes) so
 // fleetTracker.build can fold them into the fleet summary using the same
 // {bus}_{cam} parsing it already applies to real MediaMTX paths.
 // DirectKind carries which kind (embed/hls) so camDetail/streamInfo can
 // report it accurately instead of assuming "embed" for anything synthetic.
-func (a *apiServer) directPaths() []mtxPath {
+func (a *apiServer) directPaths() []ingestPath {
 	if a.directKeys == nil {
 		return nil
 	}
 	entries := a.directKeys()
-	paths := make([]mtxPath, len(entries))
+	paths := make([]ingestPath, len(entries))
 	for i, e := range entries {
 		url := e.EmbedURL
 		if url == "" {
 			url = e.HLSURL
 		}
-		paths[i] = mtxPath{Name: e.Key, Ready: true, DirectKind: string(e.Kind), DirectURL: url}
+		paths[i] = ingestPath{Name: e.Key, Ready: true, DirectKind: string(e.Kind), DirectURL: url}
 	}
 	return paths
 }
@@ -135,9 +110,9 @@ func (a *apiServer) vendorRosterEntries(ctx context.Context) []services.RosterEn
 // active session or real stream is always more authoritative than "the
 // vendor account reports knowing about this vehicle" (that's handled by
 // mergeRoster below, on the built summary, not here).
-func mergePaths(sources ...[]mtxPath) []mtxPath {
+func mergePaths(sources ...[]ingestPath) []ingestPath {
 	seen := make(map[string]bool)
-	var merged []mtxPath
+	var merged []ingestPath
 	for _, src := range sources {
 		for _, p := range src {
 			if seen[p.Name] {
@@ -199,7 +174,7 @@ func mergeRoster(summary fleetSummary, roster []services.RosterEntry) fleetSumma
 
 // snapshot returns cached paths+summary, refreshing from MediaMTX when stale.
 // Issue 1: stampede-safe — lock is NOT held across HTTP fetches.
-func (a *apiServer) snapshot() (*fleetSummary, []mtxPath, error) {
+func (a *apiServer) snapshot() (*fleetSummary, []ingestPath, error) {
 	a.cacheMu.Lock()
 
 	// Cache is fresh — return immediately.
@@ -230,33 +205,47 @@ func (a *apiServer) snapshot() (*fleetSummary, []mtxPath, error) {
 	a.cacheMu.Unlock()
 
 	// Fetch and build WITHOUT holding the lock.
-	paths, fetchErr := a.fetchAllPaths()
-	var summary fleetSummary
-	if fetchErr == nil {
-		paths = mergePaths(paths, a.directPaths())
-		summary = a.tracker.build(paths, time.Now())
-		summary = mergeRoster(summary, a.vendorRosterEntries(context.Background()))
+	// The ingest service is one OPTIONAL source of paths, deliberately not
+	// a hard dependency. Vendors that hand back a directly playable URL
+	// never touch it, so a deployment can legitimately run without MediaMTX
+	// and media-mtxd entirely — and even where they do run, one of them
+	// being down must not blank a fleet whose buses are all Chemito/Sumith.
+	// A failure here is logged and treated as "no RTSP-ingested channels",
+	// which is exactly what it means.
+	var paths []ingestPath
+	if a.ingest != nil {
+		ingestPaths, err := a.ingest.Paths(context.Background())
+		if err != nil {
+			log.Printf("fleet: ingest service unavailable, continuing without RTSP paths: %v", err)
+		}
+		paths = make([]ingestPath, len(ingestPaths))
+		for i, p := range ingestPaths {
+			paths[i] = ingestPath{
+				Name: p.Name, Ready: p.Ready, Tracks: p.Tracks,
+				BytesReceived: p.BytesReceived, Readers: p.Readers,
+			}
+		}
 	}
+	paths = mergePaths(paths, a.directPaths())
+	summary := a.tracker.build(paths, time.Now())
+	summary = mergeRoster(summary, a.vendorRosterEntries(context.Background()))
 
-	// Write results back under the lock.
+	// Write results back under the lock. There is no failure path left to
+	// record: a fleet built from direct sessions and the vendor roster is a
+	// complete answer even with nothing ingesting. The error return is kept
+	// so callers keep their defensive handling if a future source of paths
+	// is genuinely required.
 	a.cacheMu.Lock()
-	if fetchErr == nil {
-		a.cachedFleet = &summary
-		a.cachedPaths = paths
-		a.cachedAt = time.Now()
-		a.lastErr = nil
-	} else {
-		a.lastErr = fetchErr
-	}
+	a.cachedFleet = &summary
+	a.cachedPaths = paths
+	a.cachedAt = time.Now()
+	a.lastErr = nil
 	a.refreshing = false
 	a.cacheMu.Unlock()
 
 	// Wake all waiters.
 	close(done)
 
-	if fetchErr != nil {
-		return nil, nil, fetchErr
-	}
 	return a.cachedFleet, a.cachedPaths, nil
 }
 
@@ -343,7 +332,7 @@ type camDetail struct {
 	Tracks        []string `json:"tracks"`
 	BytesReceived uint64   `json:"bytesReceived"`
 	Readers       int      `json:"readers"`
-	Kind          string   `json:"kind,omitempty"`      // "embed" or "hls" for a non-RTSP vendor bus; omitted for real MediaMTX ingest
+	Kind          string   `json:"kind,omitempty"`      // "embed", "hls" or "flv" for a non-RTSP vendor bus; omitted for real MediaMTX ingest
 	DirectURL     string   `json:"directUrl,omitempty"` // the embed page or direct .m3u8 URL when Kind is set
 }
 
@@ -361,11 +350,12 @@ func (a *apiServer) handleBusDetail(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	detail := busDetail{ID: id, Cams: []camDetail{}}
-	for _, p := range paths {
-		busID, cam, ok := parseBusPath(p.Name)
-		if !ok || busID != id {
-			continue
-		}
+	// camsForBus filters and sorts by cam number. This used to walk `paths`
+	// raw, which returned cams in whatever order the ingest/direct sources
+	// happened to be merged in (e.g. 2,3,1,4) while GET /api/stream/{id}
+	// returned them sorted — same buses, two different orders.
+	for _, p := range camsForBus(paths, id) {
+		_, cam, _ := parseBusPath(p.Name)
 		// Issue 4: normalize nil tracks to []string{} so JSON encodes [] not null.
 		tracks := p.Tracks
 		if tracks == nil {
@@ -389,8 +379,8 @@ func (a *apiServer) handleBusDetail(w http.ResponseWriter, r *http.Request) {
 }
 
 // camsForBus filters paths to those belonging to busId, sorted by cam number.
-func camsForBus(paths []mtxPath, busID string) []mtxPath {
-	var out []mtxPath
+func camsForBus(paths []ingestPath, busID string) []ingestPath {
+	var out []ingestPath
 	for _, p := range paths {
 		id, _, ok := parseBusPath(p.Name)
 		if !ok || id != busID {
@@ -410,7 +400,7 @@ type streamInfo struct {
 	Cam       int    `json:"cam"`
 	Path      string `json:"path"`
 	Ready     bool   `json:"ready"`
-	Kind      string `json:"kind,omitempty"`      // "embed" or "hls" — no MediaMTX ingest; DirectURL below carries the vendor's own link
+	Kind      string `json:"kind,omitempty"`      // "embed", "hls" or "flv" — no MediaMTX ingest; DirectURL below carries the playable link
 	WhepURL   string `json:"whepUrl,omitempty"`   // our MediaMTX proxy path — only set for real ingest (Kind empty)
 	HLSURL    string `json:"hlsUrl,omitempty"`    // our MediaMTX proxy path — only set for real ingest (Kind empty)
 	DirectURL string `json:"directUrl,omitempty"` // the vendor's embed page or direct .m3u8 URL — only set when Kind is set
@@ -491,8 +481,8 @@ func streamResultToInfo(r domain.StreamResult, cam int) streamInfo {
 	case domain.KindEmbed:
 		si.Kind = "embed"
 		si.DirectURL = r.EmbedURL
-	case domain.KindHLS:
-		si.Kind = "hls"
+	case domain.KindHLS, domain.KindFLV:
+		si.Kind = string(r.Kind)
 		si.DirectURL = r.HLSURL
 	default:
 		si.WhepURL = "/whep/" + r.Key + "/whep"

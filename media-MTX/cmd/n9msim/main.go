@@ -15,7 +15,7 @@ import (
 	"os"
 	"time"
 
-	"mediamtx-console/vendorclients/n9m"
+	"media-mtx/n9m"
 )
 
 func main() {

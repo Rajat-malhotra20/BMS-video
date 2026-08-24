@@ -12,15 +12,18 @@ import (
 	"time"
 
 	"mediamtx-console/domain"
-	"mediamtx-console/vendorclients/bridge"
 	"mediamtx-console/vendors"
 )
 
 type StreamService struct {
-	Registry       *vendors.Registry
-	Supervisor     *bridge.Supervisor
-	RTSPPublish    string // e.g. "rtsp://localhost:8554"
-	RestartBackoff time.Duration
+	Registry *vendors.Registry
+
+	// Ingest is the media-MTX service. Vendors whose only delivery
+	// mechanism is a remux into a media server (n9m, castmaster) are not
+	// registered here at all - they live entirely in that service, and a
+	// request for one is forwarded to it. This process therefore owns no
+	// ffmpeg process, no supervisor, and no RTSP publish address.
+	Ingest *IngestClient
 
 	// directActive tracks {bus}_{cam} keys started via a non-RTSP vendor
 	// result (KindEmbed or KindHLS), along with the resolved URL so a later
@@ -47,6 +50,12 @@ type StreamService struct {
 	channelCountsMu       sync.Mutex
 	channelCountsCache    map[string]int
 	channelCountsCachedAt time.Time
+
+	// ingestVendors remembers which vendor names the media-MTX service
+	// serves, learned from its /cameras roster, so StartAny can route a
+	// request without this process hardcoding the split.
+	ingestVendorMu sync.Mutex
+	ingestVendors  map[string]bool
 }
 
 const rosterCacheTTL = 30 * time.Second
@@ -97,6 +106,32 @@ func (s *StreamService) VendorRoster(ctx context.Context) []RosterEntry {
 			entries = append(entries, RosterEntry{
 				Key:          c.VendorID + "_1",
 				Vendor:       adapter.Name(),
+				Label:        label,
+				Online:       c.Online,
+				Channels:     c.Channels,
+				VendorParams: c.VendorParams,
+			})
+		}
+	}
+
+	// The media-MTX service vendors (n9m, castmaster) are not registered
+	// here, so ask it what its own accounts know about. Best-effort for the
+	// same reason as above: if that service is down, the vendors this
+	// process serves directly must still show up.
+	if s.Ingest != nil {
+		cams, err := s.Ingest.Cameras(ctx)
+		if err != nil {
+			log.Printf("vendor roster: ingest service: %v", err)
+		}
+		for _, c := range cams {
+			s.noteIngestVendor(c.Vendor)
+			label := c.Label
+			if label == c.VendorID {
+				label = ""
+			}
+			entries = append(entries, RosterEntry{
+				Key:          c.VendorID + "_1",
+				Vendor:       c.Vendor,
 				Label:        label,
 				Online:       c.Online,
 				Channels:     c.Channels,
@@ -168,10 +203,6 @@ func (s *StreamService) StartStream(ctx context.Context, req domain.StreamReques
 	}
 
 	key := req.Bus + "_" + strconv.Itoa(req.Cam)
-	if s.Supervisor.Running(key) {
-		return domain.StreamResult{}, &bridge.ErrAlreadyRunning{Key: key}
-	}
-	req.RTSPOut = s.RTSPPublish + "/" + key
 
 	src, err := adapter.ResolveLiveSource(ctx, req)
 	if err != nil {
@@ -179,6 +210,22 @@ func (s *StreamService) StartStream(ctx context.Context, req domain.StreamReques
 	}
 
 	switch src.Kind {
+	case domain.KindFLV:
+		// No ffmpeg, no MediaMTX: the browser plays the vendor's FLV
+		// through our proxy, which calls src.Upstream fresh per connect.
+		// Cached as active for the same reason KindHLS is — later
+		// GET /api/stream/{id}?cam=N calls resolve from here instead of
+		// re-running the vendor's start-streaming side effect, and it's
+		// what /api/flv/{key} looks the Upstream func up in.
+		flvURL := "/api/flv/" + key
+		s.directMu.Lock()
+		if s.directActive == nil {
+			s.directActive = make(map[string]DirectEntry)
+		}
+		s.directActive[key] = DirectEntry{Key: key, Kind: src.Kind, HLSURL: flvURL, Upstream: src.Upstream, HasAudio: src.HasAudio}
+		s.directMu.Unlock()
+		return domain.StreamResult{Key: key, Kind: src.Kind, HLSURL: flvURL}, nil
+
 	case domain.KindHLS:
 		// Only a confirmed real stream is worth caching as "active" — an
 		// HLS probe that just succeeded is a strong signal. Caching this
@@ -203,22 +250,73 @@ func (s *StreamService) StartStream(ctx context.Context, req domain.StreamReques
 		return domain.StreamResult{Key: key, Kind: src.Kind, EmbedURL: src.EmbedURL}, nil
 
 	case domain.KindRTSP:
-		run := src.Remux.Run
-		if run == nil {
-			run = bridge.RemuxToRTSP(src.Remux.URL, req.RTSPOut)
-		}
-		backoff := s.RestartBackoff
-		if src.RestartBackoff > 0 {
-			backoff = src.RestartBackoff
-		}
-		if err := s.Supervisor.Start(key, run, backoff); err != nil {
-			return domain.StreamResult{}, err
-		}
-		return domain.StreamResult{Key: key, Kind: domain.KindRTSP, RTSPOut: req.RTSPOut}, nil
+		// No adapter registered here returns this any more - the vendors
+		// that need a remux moved to the media-MTX service, reached via
+		// StartIngest rather than resolved here. Kept as an explicit error
+		// so a future locally-registered RTSP adapter fails loudly instead
+		// of silently publishing nowhere.
+		return domain.StreamResult{}, fmt.Errorf(
+			"adapter %q returned kind %q: RTSP vendors belong in the media-MTX service, not this API",
+			req.Vendor, src.Kind)
 
 	default:
 		return domain.StreamResult{}, fmt.Errorf("adapter %q returned unknown source kind %q", req.Vendor, src.Kind)
 	}
+}
+
+// ErrAlreadyRunning is returned when a channel is already live.
+type ErrAlreadyRunning struct{ Key string }
+
+func (e *ErrAlreadyRunning) Error() string {
+	return fmt.Sprintf("stream %q already running", e.Key)
+}
+
+// StartIngest forwards a bus/cam to the media-MTX service, for vendors that
+// only deliver via a remux into a media server. The result is reported as
+// KindRTSP with the media-server path that service published to - identical
+// to what this API returned when it ran the remux itself, so the frontend
+// contract is unchanged.
+func (s *StreamService) StartIngest(ctx context.Context, req domain.StreamRequest) (domain.StreamResult, error) {
+	if s.Ingest == nil {
+		return domain.StreamResult{}, fmt.Errorf("no ingest service configured for vendor %q", req.Vendor)
+	}
+	key := req.Bus + "_" + strconv.Itoa(req.Cam)
+	res, err := s.Ingest.Start(ctx, req.Bus, req.Cam, req.Vendor, req.Main, req.Audio, req.VendorParams)
+	if err != nil {
+		return domain.StreamResult{}, err
+	}
+	return domain.StreamResult{Key: key, Kind: domain.KindRTSP, RTSPOut: res.RTSPOut}, nil
+}
+
+// isIngestVendor / noteIngestVendor track which vendor names the media-MTX
+// service serves, learned from its own roster rather than hardcoded here.
+func (s *StreamService) isIngestVendor(vendor string) bool {
+	s.ingestVendorMu.Lock()
+	defer s.ingestVendorMu.Unlock()
+	return s.ingestVendors[vendor]
+}
+
+func (s *StreamService) noteIngestVendor(vendor string) {
+	s.ingestVendorMu.Lock()
+	if s.ingestVendors == nil {
+		s.ingestVendors = make(map[string]bool)
+	}
+	s.ingestVendors[vendor] = true
+	s.ingestVendorMu.Unlock()
+}
+
+// StartAny routes to whichever side owns req.Vendor: a locally registered
+// adapter (Chemito FLV, Sumith HLS/embed) or the media-MTX service. Callers
+// need not know which, only that a vendor name resolves somewhere.
+func (s *StreamService) StartAny(ctx context.Context, req domain.StreamRequest) (domain.StreamResult, error) {
+	key := req.Bus + "_" + strconv.Itoa(req.Cam)
+	if s.IsActive(key) {
+		return domain.StreamResult{}, &ErrAlreadyRunning{Key: key}
+	}
+	if _, err := s.Registry.Get(req.Vendor); err != nil && s.isIngestVendor(req.Vendor) {
+		return s.StartIngest(ctx, req)
+	}
+	return s.StartStream(ctx, req)
 }
 
 // IsActive reports whether key is already live — either a supervised RTSP
@@ -229,36 +327,41 @@ func (s *StreamService) StartStream(ctx context.Context, req domain.StreamReques
 // (login, getLiveStreamingLink, ...) on every poll — Supervisor.Running
 // alone only catches the RTSP case.
 func (s *StreamService) IsActive(key string) bool {
-	if s.Supervisor.Running(key) {
-		return true
-	}
 	s.directMu.Lock()
 	defer s.directMu.Unlock()
 	_, ok := s.directActive[key]
 	return ok
 }
 
-// Nudge wakes an RTSP job that's currently sleeping between failed retry
-// attempts, so real traffic for a bus/cam stuck in backoff (or its
-// give-up cooldown) gets a fresh attempt now instead of waiting out
-// however long is left. A no-op for a direct (embed/HLS) session — those
-// don't retry via Supervisor — or a job that doesn't exist.
-func (s *StreamService) Nudge(key string) {
-	s.Supervisor.Kick(key)
-}
-
-func (s *StreamService) StopStream(key string) bool {
+// StopStream drops a tracked direct session and asks the ingest service to
+// stop any remux job under the same key. Reports whether either had one.
+func (s *StreamService) StopStream(ctx context.Context, key string) bool {
 	s.directMu.Lock()
 	_, wasDirect := s.directActive[key]
 	delete(s.directActive, key)
 	s.directMu.Unlock()
 
-	stopped := s.Supervisor.Stop(key)
+	stopped := false
+	if s.Ingest != nil {
+		stopped = s.Ingest.Stop(ctx, key)
+	}
 	return stopped || wasDirect
 }
 
-func (s *StreamService) ListActive() []bridge.Status {
-	return s.Supervisor.List()
+// ListActive reports the ingest service remux jobs. Direct (FLV/HLS)
+// sessions are not jobs - nothing supervises them, since no process sits
+// between the vendor and the browser - so they surface via
+// ActiveDirectKeys and the fleet view instead.
+func (s *StreamService) ListActive(ctx context.Context) []IngestJob {
+	if s.Ingest == nil {
+		return []IngestJob{}
+	}
+	jobs, err := s.Ingest.Jobs(ctx)
+	if err != nil {
+		log.Printf("list active: ingest jobs: %v", err)
+		return []IngestJob{}
+	}
+	return jobs
 }
 
 // DirectEntry is one {bus}_{cam} key currently live via a non-RTSP vendor
@@ -270,6 +373,15 @@ type DirectEntry struct {
 	Kind     domain.SourceKind
 	EmbedURL string
 	HLSURL   string
+	// Upstream is set only for KindFLV: what /api/flv/{key} calls to get a
+	// fresh vendor stream URL for each viewer that connects. Never
+	// serialized — the browser only ever sees HLSURL (our proxy path), so
+	// the vendor's single-use token stays server-side.
+	Upstream func(ctx context.Context) (string, error)
+	// HasAudio mirrors domain.LiveSource.HasAudio — whether audio was
+	// actually requested, so the proxy knows if the vendor's FLV header is
+	// lying about having an audio track.
+	HasAudio bool
 }
 
 // ActiveDirectKeys returns the keys currently live via a non-RTSP vendor
@@ -283,6 +395,17 @@ func (s *StreamService) ActiveDirectKeys() []DirectEntry {
 		entries = append(entries, e)
 	}
 	return entries
+}
+
+// DirectEntryFor returns the tracked direct session under key, if any —
+// how the /api/flv/{key} proxy reaches that session's Upstream resolver
+// without re-running StartStream (which would re-trigger the vendor's
+// start-streaming call on every viewer connect, not just the first).
+func (s *StreamService) DirectEntryFor(key string) (DirectEntry, bool) {
+	s.directMu.Lock()
+	defer s.directMu.Unlock()
+	e, ok := s.directActive[key]
+	return e, ok
 }
 
 func (s *StreamService) ListCameras(ctx context.Context, vendor string, vendorParams map[string]string) ([]domain.Camera, error) {

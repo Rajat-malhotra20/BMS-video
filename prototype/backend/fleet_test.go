@@ -34,7 +34,7 @@ func TestParseBusPath(t *testing.T) {
 func TestBuildFleet(t *testing.T) {
 	now := time.Date(2026, 6, 12, 12, 0, 0, 0, time.UTC)
 	tracker := newFleetTracker()
-	fleet := tracker.build([]mtxPath{
+	fleet := tracker.build([]ingestPath{
 		{Name: "DL1PC0001_1", Ready: true},
 		{Name: "DL1PC0001_2", Ready: true},
 		{Name: "DL1PC0002_1", Ready: true},
@@ -52,7 +52,7 @@ func TestBuildFleet(t *testing.T) {
 		t.Fatalf("bus[0] = %+v, want id DL1PC0001 with 2 cams", fleet.Buses[0])
 	}
 
-	fleet2 := tracker.build([]mtxPath{
+	fleet2 := tracker.build([]ingestPath{
 		{Name: "DL1PC0002_1", Ready: true},
 	}, now.Add(2*time.Minute))
 	if len(fleet2.Buses) != 2 {
@@ -68,7 +68,7 @@ func TestBuildFleet(t *testing.T) {
 		t.Fatalf("bus DL1PC0001 should be present with 0 cams, got %+v", bus1)
 	}
 
-	fleet3 := tracker.build([]mtxPath{
+	fleet3 := tracker.build([]ingestPath{
 		{Name: "DL1PC0002_1", Ready: true},
 	}, now.Add(11*time.Minute))
 	if len(fleet3.Buses) != 1 {

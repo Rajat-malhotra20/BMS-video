@@ -3,7 +3,7 @@ package n9mserver
 import (
 	"io"
 
-	"mediamtx-console/vendorclients/n9m"
+	"media-mtx/n9m"
 )
 
 // MediaFrameReader adapts a *n9m.Conn's Media channel into an io.Reader,
