@@ -92,16 +92,23 @@ playback succeeds.
 ## 3. Get a playable video link for one camera
 
 ```
-GET /api/stream/DL1PC0001?cam=1
+GET /api/stream/DL1PC0001          # every camera on the bus
+GET /api/stream/DL1PC0001?cam=1    # just one
 ```
 
-**Always pass `?cam=N`.** Calling this without it only reports
-already-active sessions and starts nothing — it'll return `[]` for a bus
-nobody has watched yet, even if that bus is really online.
+Without `?cam=N` you get **every** channel the vendor reports for that bus,
+starting any that aren't live yet — one call per bus is all a grid needs.
+With `?cam=N` you get that one channel.
 
-If that cam isn't already live, this starts it on demand — first call
-after the bus has been idle can take a few seconds while it connects;
-poll again if `ready` isn't `true` yet.
+Either way, cameras that aren't already live are started on demand, so the
+first call after a bus has been idle can take a few seconds; poll again if
+`ready` isn't `true` yet.
+
+`ready: true` means the session is registered, **not** that video is
+flowing — the recorder is only contacted when you fetch the stream. A bus
+reporting 9 cameras commonly has fewer wired: expect some tiles to 502 on
+playback and render them as unavailable rather than treating it as an
+error.
 
 Response shape depends on how that camera is delivered — check for a
 `kind` field to decide how to play it:
@@ -220,8 +227,15 @@ the code for them lives in `media-MTX/`.
   that turns out to be offline once you actually play it. Treat a `502`
   from playback, not absence from the fleet list, as the real liveness
   signal.
+- One vendor account allows **one active login at a time** (Chemito
+  enforces this — a new login invalidates the previous key). The server
+  logs in once and shares that session, so a full grid is fine, but two
+  backends on the same credentials (a local one and the deployed one) will
+  knock out each other's cameras as they open. A stream already playing is
+  unaffected; only ones being opened at that instant die.
 - Each `kind: "flv"` viewer opens its own session on the recorder, and
-  these devices support only a few at once. Several people watching the
+  these devices support only a few at once (measured: 6-7 concurrent
+  channels on one bus before it starts refusing). Several people watching the
   same bus at the same time can exhaust it. Don't hold players open on
   cameras nobody is looking at — destroy the player when its tile is
   hidden.

@@ -1,12 +1,16 @@
 package main
 
 import (
+	"context"
 	"encoding/json"
 	"fmt"
 	"net/http"
 	"net/http/httptest"
+	"strconv"
 	"strings"
 	"testing"
+
+	"mediamtx-console/domain"
 )
 
 func TestFleetHandler(t *testing.T) {
@@ -251,5 +255,87 @@ func TestStreamRecordingHandler_MissingParams(t *testing.T) {
 
 	if rec.Code != http.StatusBadRequest {
 		t.Fatalf("status = %d, want 400", rec.Code)
+	}
+}
+
+// A bare GET /api/stream/{id} must bring up every channel, not just ones
+// already running — that's the whole point of hitting a bus id: one call,
+// all cams. Cam 1 here is already live in the snapshot; 2-4 are not and
+// have to be started.
+func TestStreamLiveHandler_AllCamsStartsMissing(t *testing.T) {
+	mtx := fakeIngest(`[{"name":"DL1PC0001_1","ready":true}]`)
+	defer mtx.Close()
+
+	api := newAPIServer(mtx.URL)
+	var started []int
+	api.ensureStream = func(_ context.Context, bus string, cam int) (*domain.StreamResult, error) {
+		started = append(started, cam)
+		if cam == 3 {
+			return nil, fmt.Errorf("camera %d is dead", cam) // must not blank the others
+		}
+		return &domain.StreamResult{
+			Key:    bus + "_" + strconv.Itoa(cam),
+			Kind:   domain.KindFLV,
+			HLSURL: "/api/flv/" + bus + "_" + strconv.Itoa(cam),
+		}, nil
+	}
+
+	req := httptest.NewRequest("GET", "/api/stream/DL1PC0001", nil)
+	req.SetPathValue("id", "DL1PC0001")
+	rec := httptest.NewRecorder()
+	api.handleStreamLive(rec, req)
+
+	var got []streamInfo
+	if err := json.Unmarshal(rec.Body.Bytes(), &got); err != nil {
+		t.Fatalf("bad json: %v", err)
+	}
+	if len(started) != 3 || started[0] != 2 || started[2] != 4 {
+		t.Fatalf("started = %v, want cams 2,3,4 (1 was already live)", started)
+	}
+	if len(got) != 3 {
+		t.Fatalf("len(got) = %d, want 3 (cam 3 failed to start)", len(got))
+	}
+	for i, wantCam := range []int{1, 2, 4} {
+		if got[i].Cam != wantCam {
+			t.Fatalf("got[%d].Cam = %d, want %d (sorted)", i, got[i].Cam, wantCam)
+		}
+	}
+	if got[1].Kind != "flv" || got[1].DirectURL != "/api/flv/DL1PC0001_2" {
+		t.Fatalf("got[1] = %+v, want the started FLV entry", got[1])
+	}
+}
+
+// The fan-out must follow the vendor's own channel count, not a fixed 4 —
+// Chemito reports 9 per DVR and 7 of them really stream. Capping at 4 hid
+// three working cameras.
+func TestStreamLiveHandler_AllCamsUsesVendorChannelCount(t *testing.T) {
+	mtx := fakeIngest(`[]`)
+	defer mtx.Close()
+
+	api := newAPIServer(mtx.URL)
+	api.channelCounts = func(context.Context) map[string]int { return map[string]int{"DL1PC0001": 9} }
+	var started []int
+	api.ensureStream = func(_ context.Context, bus string, cam int) (*domain.StreamResult, error) {
+		started = append(started, cam)
+		return &domain.StreamResult{Key: bus + "_" + strconv.Itoa(cam), Kind: domain.KindFLV}, nil
+	}
+
+	req := httptest.NewRequest("GET", "/api/stream/DL1PC0001", nil)
+	req.SetPathValue("id", "DL1PC0001")
+	api.handleStreamLive(httptest.NewRecorder(), req)
+
+	if len(started) != 9 {
+		t.Fatalf("started %d cams (%v), want all 9 the vendor reports", len(started), started)
+	}
+}
+
+// Cam numbers past 9 must parse, or a bigger DVR silently loses channels.
+func TestParseBusPathTwoDigitCam(t *testing.T) {
+	bus, cam, ok := parseBusPath("DL1PC0001_12")
+	if !ok || bus != "DL1PC0001" || cam != 12 {
+		t.Fatalf("parseBusPath = (%q, %d, %v), want (DL1PC0001, 12, true)", bus, cam, ok)
+	}
+	if _, _, ok := parseBusPath("DL1PC0001_01"); ok {
+		t.Fatalf("leading-zero cam should not parse")
 	}
 }

@@ -149,6 +149,21 @@ func (c *Client) Login(username, password string) (string, error) {
 	return c.key, nil
 }
 
+// UseKey adopts an already-issued verify key instead of logging in again.
+//
+// This exists because the server keeps ONE active session per account: a
+// second Login invalidates the first key, and every stream token minted
+// from it dies with it. Confirmed live 2026-08-26 — six channels opened at
+// once, each with its own Login, left only the last one playing; the same
+// six sharing a single key all played. Callers must therefore log in once
+// and pass the key around, not construct a fresh logged-in client per
+// request.
+func (c *Client) UseKey(key string) { c.key = key }
+
+// Key returns the verify key this client is using, for a caller that wants
+// to cache it and hand it to the next client via UseKey.
+func (c *Client) Key() string { return c.key }
+
 // VideoPort is one available live-preview relay port. This is the
 // connectable port for LiveVideoURL — confirmed live 2026-08-19: a device's
 // own ListDevices "transmitport" resets the connection immediately, while

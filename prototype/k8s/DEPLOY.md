@@ -142,6 +142,33 @@ kubectl -n bms-dev rollout restart deploy/bms-video
 
 ---
 
+## One vendor account = one active session
+
+Chemito keeps a **single active session per account**: every login issues a
+new key and invalidates the previous one. A stream already flowing is
+unaffected (the token is checked only at connect time), but a stream being
+*opened* at that moment dies. Confirmed live 2026-08-26 — six channels
+opened concurrently, each with its own login, left one playing; the same
+six sharing one key all played.
+
+The backend now logs in once per process and shares the key
+(`vendors/chemitoapi.Adapter.session`), so a grid of cameras is fine. What
+it cannot defend against is **two processes on the same credentials**:
+
+- Running a local backend against the production Chemito account while the
+  pod is live. Each side's logins knock out cameras the other is opening.
+  Use a separate account locally, or stop the local backend before testing
+  prod.
+- Scaling `bms-video` past one replica. It is `replicas: 1` with
+  `strategy: Recreate` for this reason — do not raise it without giving
+  each replica its own vendor account.
+
+Sumith is treated the same way (one shared token per process), though it has
+not been shown to have the same single-session rule; its stream URLs are
+vendor-hosted, so a stale token cannot cut a playing stream.
+
+---
+
 ## Access
 
 | Purpose | Address |

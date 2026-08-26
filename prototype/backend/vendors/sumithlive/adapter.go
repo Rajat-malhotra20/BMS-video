@@ -6,6 +6,8 @@ package sumithlive
 import (
 	"context"
 	"strconv"
+	"sync"
+	"time"
 
 	"mediamtx-console/domain"
 	rawclient "mediamtx-console/vendorclients/sumithlive"
@@ -22,9 +24,58 @@ type Config struct {
 
 type Adapter struct {
 	cfg Config
+
+	// tokenMu/token/tokenAt hold the shared access token. See accessToken.
+	tokenMu sync.Mutex
+	token   string
+	tokenAt time.Time
 }
 
 func New(cfg Config) *Adapter { return &Adapter{cfg: cfg} }
+
+// tokenTTL is how long an access token is reused before re-authenticating.
+// The vendor documents no expiry, so this is a conservative refresh; a
+// token rejected earlier than that is handled by the retry in
+// ResolveLiveSource.
+const tokenTTL = 10 * time.Minute
+
+// accessToken returns the shared access token, authenticating only when
+// there isn't a usable one. reused reports whether it came from the cache,
+// which tells the caller whether a failure is worth retrying with a fresh
+// one.
+//
+// One token for the whole process rather than one per call, for the same
+// reason vendors/chemitoapi shares its key: opening a grid of cameras
+// otherwise fires one login per tile at the same instant. Chemito was
+// confirmed to keep a single session per account and drop all but the last
+// (see that adapter's session()); Sumith has not been shown to do that, but
+// the redundant logins are pointless either way, and its stream URLs are
+// vendor-hosted so a stale token cannot cut a playing stream.
+//
+// The lock is held across the login so concurrent first-calls queue behind
+// one round trip instead of each starting their own.
+func (a *Adapter) accessToken() (tok string, reused bool, err error) {
+	a.tokenMu.Lock()
+	defer a.tokenMu.Unlock()
+
+	if a.token != "" && time.Since(a.tokenAt) < tokenTTL {
+		return a.token, true, nil
+	}
+	client := rawclient.NewClient(a.cfg.BaseURL, nil)
+	tok, err = client.GetAccessToken(a.cfg.Username, a.cfg.Password)
+	if err != nil {
+		return "", false, domain.WrapVendorErr("sumithlive", "login", err)
+	}
+	a.token, a.tokenAt = tok, time.Now()
+	return tok, false, nil
+}
+
+// forgetToken drops the cached token so the next call re-authenticates.
+func (a *Adapter) forgetToken() {
+	a.tokenMu.Lock()
+	a.token = ""
+	a.tokenMu.Unlock()
+}
 
 func (a *Adapter) Name() string { return "sumithlive" }
 
@@ -41,9 +92,9 @@ func (a *Adapter) Name() string { return "sumithlive" }
 // original KindEmbed jspLink — no regression versus the old behavior.
 func (a *Adapter) ResolveLiveSource(ctx context.Context, req domain.StreamRequest) (domain.LiveSource, error) {
 	client := rawclient.NewClient(a.cfg.BaseURL, nil)
-	token, err := client.GetAccessToken(a.cfg.Username, a.cfg.Password)
+	token, reused, err := a.accessToken()
 	if err != nil {
-		return domain.LiveSource{}, domain.WrapVendorErr("sumithlive", "login", err)
+		return domain.LiveSource{}, err
 	}
 
 	plateNo := req.VendorParams["plateNo"]
@@ -54,6 +105,15 @@ func (a *Adapter) ResolveLiveSource(ctx context.Context, req domain.StreamReques
 	projectID := atoiOr(req.VendorParams["projectId"], atoiOr(a.cfg.DefaultProjectID, 0))
 
 	link, err := client.GetLiveStreamingLink(token, plateNo, channel, projectID)
+	// Only retry when the token came from the cache: a freshly minted one
+	// that fails failed for a real reason (device offline, bad plate), and
+	// re-authenticating would just double every such call.
+	if err != nil && reused {
+		a.forgetToken()
+		if token, _, err = a.accessToken(); err == nil {
+			link, err = client.GetLiveStreamingLink(token, plateNo, channel, projectID)
+		}
+	}
 	if err != nil {
 		return domain.LiveSource{}, domain.WrapVendorErr("sumithlive", "resolve live streaming link", err)
 	}

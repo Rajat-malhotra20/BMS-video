@@ -437,6 +437,15 @@ func (a *apiServer) handleStreamLive(w http.ResponseWriter, r *http.Request) {
 		result = append(result, si)
 	}
 
+	// No specific cam asked for: hitting a bus id should hand back every
+	// channel at once, which means starting the ones nobody has opened
+	// yet. Without this the bare bus URL only ever reported channels some
+	// earlier request happened to start — an empty array on a fresh
+	// process, with nothing triggering a start.
+	if camFilter == "" {
+		result = a.ensureAllCams(r.Context(), id, result)
+	}
+
 	// Nothing found for the specific cam asked for — either it's already
 	// active but started too recently for the (2s) fleet cache to show it
 	// yet, or it's genuinely not started. Check directKeys fresh (it's an
@@ -471,6 +480,83 @@ func (a *apiServer) handleStreamLive(w http.ResponseWriter, r *http.Request) {
 	}
 
 	writeJSON(w, result)
+}
+
+// camsPerBusFallback is how many channels a bare GET /api/stream/{id}
+// brings up when the vendor reports no channel count of its own (N9M and
+// Castmaster don't). A guess, but a bounded one.
+const camsPerBusFallback = 4
+
+// camsPerBusCeiling bounds the fan-out even when a vendor claims more.
+// Chemito's live-video ports hold 4 channels each and the account exposes
+// 4 of them, so 16 concurrent channels is the account-wide ceiling
+// (PMIDTC_CIPLAPIS.xlsx §4: "4-way video on one port and 16-way video at
+// most at the same time"). Asking for more than that cannot be served no
+// matter which bus asks.
+const camsPerBusCeiling = 16
+
+// ensureAllCams brings up every channel of bus that isn't live yet and
+// appends it to have. A channel that fails to start is logged and skipped,
+// never fatal: one dead camera must not blank the other three.
+func (a *apiServer) ensureAllCams(ctx context.Context, bus string, have []streamInfo) []streamInfo {
+	if a.ensureStream == nil {
+		return have
+	}
+
+	// The vendor's own channel count, not a fixed guess: Chemito reports 9
+	// for these DVRs and 7 of them really do stream (confirmed live
+	// 2026-08-26 on DL1PD8584 — 1-7 deliver, 8-9 are unwired and answer
+	// 408/EOF). Capping at 4 silently hid three working cameras.
+	n := camsPerBusFallback
+	if a.channelCounts != nil {
+		if c := a.channelCounts(ctx)[bus]; c > 0 {
+			n = c
+		}
+	}
+	if n > camsPerBusCeiling {
+		n = camsPerBusCeiling
+	}
+
+	seen := make(map[int]bool, len(have))
+	for _, si := range have {
+		seen[si.Cam] = true
+	}
+
+	for cam := 1; cam <= n; cam++ {
+		if seen[cam] {
+			continue
+		}
+		key := bus + "_" + strconv.Itoa(cam)
+
+		// Check the live session map before starting: the fleet snapshot
+		// this result was built from is up to 2s stale, so a channel
+		// started moments ago is active but missing from `have`.
+		if a.directKeys != nil {
+			found := false
+			for _, e := range a.directKeys() {
+				if e.Key == key {
+					have = append(have, directEntryToInfo(e, cam))
+					found = true
+					break
+				}
+			}
+			if found {
+				continue
+			}
+		}
+
+		started, err := a.ensureStream(ctx, bus, cam)
+		if err != nil {
+			log.Printf("stream live: %s: %v", key, err)
+			continue
+		}
+		if started != nil {
+			have = append(have, streamResultToInfo(*started, cam))
+		}
+	}
+
+	sort.Slice(have, func(i, j int) bool { return have[i].Cam < have[j].Cam })
+	return have
 }
 
 // streamResultToInfo renders a just-started domain.StreamResult in the

@@ -56,7 +56,11 @@ type fleetSummary struct {
 	UpdatedAt int64       `json:"updatedAt"`
 }
 
-var busPathRe = regexp.MustCompile(`^(?:.*/)?([A-Za-z0-9]+)_([1-9])$`)
+// Two digits, because a channel number is not capped at 9: Chemito's DVRs
+// report 9 channels today, and a single-digit pattern would silently drop
+// cam 10+ on a bigger device rather than fail visibly. No leading zero, so
+// "_01" still doesn't parse.
+var busPathRe = regexp.MustCompile(`^(?:.*/)?([A-Za-z0-9]+)_([1-9][0-9]?)$`)
 
 // parseBusPath extracts bus id and camera number from a stream path name.
 func parseBusPath(name string) (busID string, cam int, ok bool) {
