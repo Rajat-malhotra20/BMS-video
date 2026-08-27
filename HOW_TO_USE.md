@@ -15,6 +15,27 @@ those endpoints — never build one yourself.
 > `GET /` lists exactly what this server is serving right now; trust it over
 > this document if they ever disagree.
 
+## 0. Authentication
+
+Every request except `GET /health` needs the shared token, either as a
+header or a query parameter:
+
+```
+Authorization: Bearer <token>
+```
+```
+GET /api/stream/DL1PC0001?token=<token>
+```
+
+Use the query form for URLs a browser fetches on its own — a `<video src>`
+playing HLS cannot attach a header. Ask whoever deployed the API for the
+token; a missing or wrong one returns `401`.
+
+If the deployment has no token configured the API answers without one, but
+do not rely on that: it is the unlocked-development state, not the contract.
+
+---
+
 ## 1. List every bus
 
 ```
@@ -233,9 +254,18 @@ the code for them lives in `media-MTX/`.
   backends on the same credentials (a local one and the deployed one) will
   knock out each other's cameras as they open. A stream already playing is
   unaffected; only ones being opened at that instant die.
-- Each `kind: "flv"` viewer opens its own session on the recorder, and
-  these devices support only a few at once (measured: 6-7 concurrent
-  channels on one bus before it starts refusing). Several people watching the
+- Viewers are free. Every `kind: "flv"` camera has ONE upstream connection
+  to the recorder, shared by everyone watching it — ten people on a camera
+  costs the device exactly what one person costs (verified with 12
+  simultaneous viewers on one camera). What the device does ration is
+  *channels*: measured 6-7 concurrent channels on one bus before it starts
+  refusing, and 16 across the whole account.
+- An FLV response is never closed once it has started playing. If the
+  camera drops (a bus losing signal), the server reconnects underneath and
+  sends keep-alive tags meanwhile, so the tile recovers on its own. Do NOT
+  build a reconnect loop in the player for `kind: "flv"` — a closed
+  connection means the viewer went away, not the camera. A camera that has
+  never delivered video still fails fast with a `502`. Several people watching the
   same bus at the same time can exhaust it. Don't hold players open on
   cameras nobody is looking at — destroy the player when its tile is
   hidden.

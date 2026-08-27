@@ -6,10 +6,8 @@ import (
 	"errors"
 	"fmt"
 	"io"
-	"log"
 	"net/http"
 	"strconv"
-	"sync"
 	"time"
 
 	vendorconfig "mediamtx-console/config"
@@ -27,60 +25,13 @@ type unifiedBridgeServer struct {
 	stream *services.StreamService
 	buses  map[string]vendorconfig.Bus
 
-	// flvMu/flvFailedAt throttle FLV reconnect storms per {bus}_{cam}. See
-	// flvFailureCooldown.
-	flvMu       sync.Mutex
-	flvFailedAt map[string]time.Time
+	// hub holds one upstream vendor connection per {bus}_{cam}, shared by
+	// every viewer of that camera. See flvhub.go.
+	hub *flvHub
 }
 
 func newUnifiedBridgeServer(stream *services.StreamService, buses map[string]vendorconfig.Bus) *unifiedBridgeServer {
-	return &unifiedBridgeServer{stream: stream, buses: buses, flvFailedAt: make(map[string]time.Time)}
-}
-
-// flvFailureCooldown is how long a {bus}_{cam} that just failed upstream is
-// refused locally, without calling the vendor at all.
-//
-// This is a device-protection measure, not a nicety. Chemito has no
-// session-close call, so every attempt against a struggling device leaves
-// another phantom session open server-side — and a player that reconnects
-// on error (which every sane player does) turns one bad channel into a
-// steady leak. Observed live 2026-08-24: a 2s-retry loop across 4 channels
-// took DLPD8611 from streaming all four fine to answering HTTP 408 on every
-// channel, including ones never opened.
-//
-// The guard lives here rather than in the player because every client
-// shares the same device: a browser, a curl loop, and a second dashboard
-// all leak the same way, and only the server sees all three.
-const flvFailureCooldown = 20 * time.Second
-
-// coolingDown reports whether key failed too recently to try again, and how
-// long is left.
-func (u *unifiedBridgeServer) coolingDown(key string) (time.Duration, bool) {
-	u.flvMu.Lock()
-	defer u.flvMu.Unlock()
-	failedAt, ok := u.flvFailedAt[key]
-	if !ok {
-		return 0, false
-	}
-	if left := flvFailureCooldown - time.Since(failedAt); left > 0 {
-		return left, true
-	}
-	delete(u.flvFailedAt, key)
-	return 0, false
-}
-
-// noteFLVFailure/clearFLVFailure record whether the last upstream attempt
-// for key reached a real stream.
-func (u *unifiedBridgeServer) noteFLVFailure(key string) {
-	u.flvMu.Lock()
-	u.flvFailedAt[key] = time.Now()
-	u.flvMu.Unlock()
-}
-
-func (u *unifiedBridgeServer) clearFLVFailure(key string) {
-	u.flvMu.Lock()
-	delete(u.flvFailedAt, key)
-	u.flvMu.Unlock()
+	return &unifiedBridgeServer{stream: stream, buses: buses, hub: newFLVHub()}
 }
 
 type bridgeStartRequest struct {
@@ -157,7 +108,11 @@ func (u *unifiedBridgeServer) ensureStream(ctx context.Context, bus string, cam 
 		// when a start arrives for a job it is already sleeping on.
 		return nil, nil
 	}
-	result, configured, err := u.startBus(ctx, bus, cam, true, false)
+	// audio=true: cameras with a microphone carry AAC (confirmed live
+	// 2026-08-27, ~10% more bandwidth), and the hub drops the header's
+	// audio bit for cameras that turn out not to have one. Players mute
+	// their own tiles; the stream carries the track either way.
+	result, configured, err := u.startBus(ctx, bus, cam, true, true)
 	if !configured {
 		return nil, nil
 	}
@@ -175,6 +130,11 @@ func (u *unifiedBridgeServer) handleStop(w http.ResponseWriter, r *http.Request)
 	}
 	stopped := u.stream.StopStream(r.Context(), key)
 	writeJSON(w, map[string]any{"key": key, "stopped": stopped})
+}
+
+// handleHub reports what every FLV channel is doing right now.
+func (u *unifiedBridgeServer) handleHub(w http.ResponseWriter, _ *http.Request) {
+	writeJSON(w, u.hub.stats())
 }
 
 func (u *unifiedBridgeServer) handleList(w http.ResponseWriter, r *http.Request) {
@@ -244,20 +204,12 @@ func (u *unifiedBridgeServer) handleFLVProxy(w http.ResponseWriter, r *http.Requ
 		return
 	}
 
-	// Refuse locally before touching the vendor — see flvFailureCooldown.
-	if left, cooling := u.coolingDown(key); cooling {
-		w.Header().Set("Retry-After", strconv.Itoa(int(left.Seconds())+1))
-		http.Error(w, fmt.Sprintf("%s failed recently; cooling down for %s", key, left.Round(time.Second)),
-			http.StatusServiceUnavailable)
-		return
-	}
-
 	entry, ok := u.stream.DirectEntryFor(key)
 	if !ok {
 		// Nobody has started this channel yet (fresh process, or the
 		// browser hit the proxy URL straight from a bookmark) — start it
 		// the same way GET /api/stream/{id}?cam=N would, then retry.
-		if _, configured, err := u.startBus(r.Context(), bus, cam, true, false); err != nil {
+		if _, configured, err := u.startBus(r.Context(), bus, cam, true, true); err != nil {
 			writeBridgeError(w, err)
 			return
 		} else if !configured {
@@ -274,97 +226,10 @@ func (u *unifiedBridgeServer) handleFLVProxy(w http.ResponseWriter, r *http.Requ
 		return
 	}
 
-	src, err := entry.Upstream(r.Context())
-	if err != nil {
-		u.noteFLVFailure(key)
-		writeBridgeError(w, err)
-		return
-	}
-
-	req, err := http.NewRequestWithContext(r.Context(), http.MethodGet, src, nil)
-	if err != nil {
-		http.Error(w, err.Error(), http.StatusBadGateway)
-		return
-	}
-	resp, err := flvClient.Do(req)
-	if err != nil {
-		// An immediate EOF here means the relay accepted the TCP connection
-		// then dropped it — in practice a channel number with no camera
-		// wired to it, distinct from the 408 below.
-		u.noteFLVFailure(key)
-		http.Error(w, fmt.Sprintf("%s: vendor closed the stream connection (channel may not be wired to a camera): %v", key, err),
-			http.StatusBadGateway)
-		return
-	}
-	defer resp.Body.Close()
-	if resp.StatusCode != http.StatusOK {
-		u.noteFLVFailure(key)
-		// 408 is the relay saying the device never pushed video in time —
-		// the device is offline/asleep or out of session capacity, not a
-		// wiring problem. Worth spelling out: the two look identical from
-		// the browser otherwise.
-		detail := ""
-		if resp.StatusCode == http.StatusRequestTimeout {
-			detail = " (device did not deliver video: offline, asleep, or out of concurrent sessions)"
-		}
-		http.Error(w, fmt.Sprintf("%s: vendor returned HTTP %d%s", key, resp.StatusCode, detail),
-			http.StatusBadGateway)
-		return
-	}
-	// Reached real video, so any earlier failure for this key is stale.
-	u.clearFLVFailure(key)
-
-	w.Header().Set("Content-Type", "video/x-flv")
-	w.Header().Set("Cache-Control", "no-store")
-	// Flush the headers now so mpegts.js can start its own parse before the
-	// first FLV tag arrives, rather than waiting on Go's write buffer.
-	flusher, canFlush := w.(http.Flusher)
-	if canFlush {
-		flusher.Flush()
-	}
-
-	body := &stallReader{r: resp.Body, timeout: flvStallTimeout, closer: resp.Body}
-	out := flushWriter{w: w, f: flusher}
-
-	// Chemito sets the FLV header's audio flag even when the stream was
-	// requested with audio=0 and it then sends zero audio tags. Any player
-	// that believes the header waits forever for an audio track that never
-	// arrives: bytes accumulate, the decoder never initializes, and the
-	// picture sits frozen with nothing rendered.
-	//
-	// Confirmed live 2026-08-24 on DL1PD8587 — channel 1 advertised 0x01
-	// (video only) and played; channels 2-4 advertised 0x05 and did not,
-	// having pulled 10-29MB each. Codec, timestamps, keyframes and decoder
-	// config were identical and valid across all four; the header flag was
-	// the only difference.
-	//
-	// Corrected here rather than with a per-player config override, because
-	// every client shares the defect — mpegts.js, ffmpeg, VLC, and whatever
-	// the frontend uses next.
-	if !entry.HasAudio {
-		var hdr [9]byte
-		if _, err := io.ReadFull(body, hdr[:]); err != nil {
-			u.noteFLVFailure(key)
-			log.Printf("flv proxy: %s: short FLV header: %v", key, err)
-			return
-		}
-		if string(hdr[0:3]) == "FLV" {
-			hdr[4] &^= 0x04 // clear the "has audio" bit
-		}
-		if _, err := out.Write(hdr[:]); err != nil {
-			return
-		}
-	}
-
-	// Each copy chunk is flushed so frames reach the player as they arrive
-	// instead of pooling in Go's write buffer.
-	_, err = io.Copy(out, body)
-	if err != nil && r.Context().Err() == nil {
-		// Viewer is still attached, so this was the vendor dropping, not a
-		// closed tab. Nothing to send — headers are long gone; the player
-		// sees EOF and reconnects (which re-resolves a fresh token).
-		log.Printf("flv proxy: %s: upstream ended: %v", key, err)
-	}
+	// Everything past here — connecting, reconnecting, holding the viewer
+	// open across a vendor outage — belongs to the hub, which shares one
+	// device session across every viewer of this camera.
+	u.hub.serve(w, r, key, entry.Upstream, entry.HasAudio)
 }
 
 // stallReader fails a Read that produces nothing for timeout, so a vendor
