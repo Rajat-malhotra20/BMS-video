@@ -113,15 +113,19 @@ must never live in a file this stack `kubectl apply`'s repeatedly. Create
 `vendor-credentials` once, out-of-band:
 
 ```bash
-kubectl -n bms-dev create configmap vendor-credentials \
+kubectl -n bms-dev create secret generic vendor-credentials \
   --from-literal=castmaster-password='...' \
   --from-literal=sumithlive-password='...' \
   --from-literal=chemitoapi-password='...'
 ```
 
-Values are plaintext and readable by anyone with namespace read access —
-a Secret would be the stronger choice; switch the `configMapKeyRef`s in
-`portainer-stack.yaml` to `secretKeyRef` if you move to one.
+These are live vendor credentials, so this is a Secret. If you created it
+earlier as a ConfigMap, delete that first — a Secret and a ConfigMap cannot
+share a name:
+
+```bash
+kubectl -n bms-dev delete configmap vendor-credentials
+```
 
 The keys are optional: only add the vendors you actually use. A missing key
 leaves that vendor unable to authenticate but does not stop the pod, since
@@ -132,12 +136,51 @@ bus→vendor map live in the `vendors-config` ConfigMap in
 
 To rotate a password later:
 ```bash
-kubectl -n bms-dev create configmap vendor-credentials \
+kubectl -n bms-dev create secret generic vendor-credentials \
   --from-literal=castmaster-password='NEW' \
   --from-literal=sumithlive-password='...' \
   --from-literal=chemitoapi-password='...' \
   --dry-run=client -o yaml | kubectl apply -f -
 kubectl -n bms-dev rollout restart deploy/bms-video
+```
+
+---
+
+## First-time setup: API bearer token
+
+Every route except `/health` requires `Authorization: Bearer <token>`, or a
+`?token=` query parameter (the query form exists because a browser playing
+HLS through a plain `<video src>` cannot attach a header).
+
+```bash
+kubectl -n bms-dev create secret generic bms-api-auth   --from-literal=token="$(openssl rand -hex 32)"
+kubectl -n bms-dev get secret bms-api-auth -o jsonpath='{.data.token}' | base64 -d; echo
+kubectl -n bms-dev rollout restart deploy/bms-video
+```
+
+Without this secret the pod still starts and the API stays **open** — that
+is deliberate, so shipping auth cannot black out a running deployment. The
+boot log says so:
+
+```
+WARNING: API_TOKEN is not set - this API is UNAUTHENTICATED.
+```
+
+Do not leave it that way. The NodePort is reachable from the internet: a
+scanner probed `GET /.env` and `POST /` on this pod on 2026-08-26. Anyone
+who can reach it can watch every camera and open vendor sessions on every
+device.
+
+---
+
+## Monitoring live streams
+
+`GET /api/hub` reports every FLV channel — viewers attached, whether it is
+live, uptime, reconnect count, dropped tags, bytes served, and the last
+upstream error. First stop when someone reports a camera not working.
+
+```bash
+curl -H "Authorization: Bearer $TOKEN" http://<node-ip>:30080/api/hub
 ```
 
 ---

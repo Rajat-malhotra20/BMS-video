@@ -100,13 +100,14 @@ data:
     }
 
 ---
-# vendor-credentials (the passwords) is NOT defined here on purpose — same
-# reasoning as ecr-pull-secret: real credential values must never live in a
-# file that gets `kubectl apply`'d repeatedly, or the next apply resets them
-# to whatever placeholder is committed. Create it once, out-of-band, with
-# keys castmaster-password / sumithlive-password / chemitoapi-password —
-# see DEPLOY.md. The configMapKeyRefs below are optional, so the pod starts
-# without it; a vendor whose password is missing just can't authenticate.
+# vendor-credentials (vendor passwords) and bms-api-auth (the API bearer
+# token) are NOT defined here on purpose — same reasoning as
+# ecr-pull-secret: real credential values must never live in a file that
+# gets `kubectl apply`'d repeatedly, or the next apply resets them to
+# whatever placeholder is committed. Create both once, out-of-band — see
+# DEPLOY.md. Every reference to them is optional, so the pod starts without
+# them: a vendor whose password is missing cannot authenticate, and a
+# missing API token leaves the API open (logged loudly at boot).
 
 ---
 # Single container: MediaMTX + Go API run together (supervisord). Backend reaches
@@ -161,6 +162,18 @@ spec:
             # real frontend origin before this is reachable from production.
             - name: CORS_ALLOWED_ORIGIN
               value: "*"
+            # Shared bearer token for every route except /health. Without
+            # it the API is open to anyone who can reach the NodePort —
+            # an internet scanner probed /.env on this pod on 2026-08-26.
+            # Create the secret out-of-band (see DEPLOY.md); optional:true
+            # so a missing secret does not crash-loop the pod, it just
+            # leaves the API unauthenticated and says so in the log.
+            - name: API_TOKEN
+              valueFrom:
+                secretKeyRef:
+                  name: bms-api-auth
+                  key: token
+                  optional: true
             # supervisord sets no working directory for the backend program,
             # so the relative "config/vendors.json" default wouldn't resolve
             # — pin absolute paths matching the vendor-config volume below.
@@ -174,21 +187,26 @@ spec:
             # override. optional: true because vendors.go reads these with
             # os.Getenv and skips an unset one, so a missing key just leaves
             # that vendor's bridge unusable instead of stopping the pod.
+            #
+            # A Secret, not a ConfigMap: these are live vendor credentials
+            # and a ConfigMap is readable by anyone with namespace read
+            # access. If you are migrating, delete the old ConfigMap of the
+            # same name first — a Secret and ConfigMap cannot share a name.
             - name: VENDOR_CASTMASTER_PASSWORD
               valueFrom:
-                configMapKeyRef:
+                secretKeyRef:
                   name: vendor-credentials
                   key: castmaster-password
                   optional: true
             - name: VENDOR_SUMITHLIVE_PASSWORD
               valueFrom:
-                configMapKeyRef:
+                secretKeyRef:
                   name: vendor-credentials
                   key: sumithlive-password
                   optional: true
             - name: VENDOR_CHEMITOAPI_PASSWORD
               valueFrom:
-                configMapKeyRef:
+                secretKeyRef:
                   name: vendor-credentials
                   key: chemitoapi-password
                   optional: true

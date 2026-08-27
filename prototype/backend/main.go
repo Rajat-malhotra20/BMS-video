@@ -34,6 +34,7 @@ type config struct {
 
 	ingestURL     string
 	corsOrigin    string
+	apiToken      string
 	vendorsConfig string
 	busesConfig   string
 }
@@ -51,6 +52,7 @@ func main() {
 		// "there is no ingest service", not "unset, use the default".
 		ingestURL:     envAllowEmpty("INGEST_URL", "http://localhost:8090"),
 		corsOrigin:    env("CORS_ALLOWED_ORIGIN", "*"),
+		apiToken:      env("API_TOKEN", ""),
 		vendorsConfig: env("VENDORS_CONFIG", "config/vendors.json"),
 		busesConfig:   env("BUSES_CONFIG", "config/buses.json"),
 	}
@@ -151,6 +153,9 @@ func main() {
 	// plays this path with mpegts.js. Not MediaMTX — see handleFLVProxy.
 	mux.HandleFunc("GET /api/flv/{key}", ubrs.handleFLVProxy)
 
+	// Live view of the FLV fan-out: channels, viewers, reconnects, drops.
+	mux.HandleFunc("GET /api/hub", ubrs.handleHub)
+
 	mux.HandleFunc("POST /api/bridge/start", ubrs.handleStart)
 	// POST stop stays either way: it also drops a tracked direct (FLV/HLS)
 	// session, which exists with no ingest side at all. GET /api/bridge
@@ -183,6 +188,7 @@ func main() {
 			"GET /api/fleet/stream",
 			"GET /api/bus/{id}",
 			"GET /api/stream/{id}",
+			"GET /api/hub",
 			"POST /api/bridge/stop?key=",
 			"GET /health",
 		}
@@ -199,7 +205,7 @@ func main() {
 
 	server := &http.Server{
 		Addr:              cfg.addr,
-		Handler:           cors(cfg.corsOrigin)(logRequests(mux)),
+		Handler:           cors(cfg.corsOrigin)(requireToken(cfg.apiToken)(logRequests(mux))),
 		ReadHeaderTimeout: 5 * time.Second,
 	}
 
@@ -246,6 +252,7 @@ func runStartupAutoStart(streamSvc *services.StreamService, buses map[string]ven
 				Cam:          cam,
 				Vendor:       vendor,
 				Main:         true,
+				Audio:        true, // see ensureStream — the hub corrects mic-less cameras
 				VendorParams: params,
 			}); err != nil {
 				log.Printf("startup-auto-start: %s cam %d: %v", busID, cam, err)
