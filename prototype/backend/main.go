@@ -195,6 +195,7 @@ func main() {
 			"GET /api/fleet/stream",
 			"GET /api/bus/{id}",
 			"GET /api/stream/{id}",
+			"GET /api/flv/{bus}_{cam}?sub=1&audio=0",
 			"GET /api/hub",
 			"POST /api/bridge/stop?key=",
 			"GET /health",

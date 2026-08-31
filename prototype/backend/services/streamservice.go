@@ -397,6 +397,36 @@ func (s *StreamService) ActiveDirectKeys() []DirectEntry {
 	return entries
 }
 
+// UpstreamFor resolves one FLV channel at the exact quality req asks for,
+// WITHOUT touching the active-session registry.
+//
+// The registry holds one entry per camera, and that entry's resolver has a
+// quality baked into it (whatever the first caller asked for). That is fine
+// as the camera's default, but a grid watching the device's sub-stream while
+// someone else watches the main stream needs two resolvers for one camera —
+// so this hands back a resolver directly and leaves the registry alone. The
+// caller (handleFLVProxy) still ensures the registry entry exists, because
+// that is what makes the camera visible in GET /api/fleet.
+//
+// Returns a VendorError for anything but an FLV source: no other kind has a
+// per-connect resolver to hand out.
+func (s *StreamService) UpstreamFor(ctx context.Context, req domain.StreamRequest) (domain.LiveSource, error) {
+	adapter, err := s.Registry.Get(req.Vendor)
+	if err != nil {
+		return domain.LiveSource{}, err
+	}
+	src, err := adapter.ResolveLiveSource(ctx, req)
+	if err != nil {
+		return domain.LiveSource{}, err
+	}
+	if src.Kind != domain.KindFLV || src.Upstream == nil {
+		return domain.LiveSource{}, &domain.VendorError{
+			Vendor: req.Vendor, Op: "resolve live source", Code: "not_flv",
+		}
+	}
+	return src, nil
+}
+
 // DirectEntryFor returns the tracked direct session under key, if any —
 // how the /api/flv/{key} proxy reaches that session's Upstream resolver
 // without re-running StartStream (which would re-trigger the vendor's

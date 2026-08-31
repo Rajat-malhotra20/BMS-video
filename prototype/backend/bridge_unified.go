@@ -64,20 +64,27 @@ func (u *unifiedBridgeServer) handleStart(w http.ResponseWriter, r *http.Request
 	writeJSON(w, result)
 }
 
-// startBus is the shared core behind handleStart and ensureStream: look up
-// the bus's vendor+params — first config/buses.json (a manual pin, or the
-// only option for a vendor with no listing API, like N9M/Castmaster), then
-// falling back to the vendor roster (Chemito's device list, Sumith's
-// vehicle list) so a bus that's only auto-discovered can still be started
-// on-demand, not just displayed. ok=false (nil error) means the bus isn't
-// findable either way — not a failure, just nothing to do.
-func (u *unifiedBridgeServer) startBus(ctx context.Context, bus string, cam int, main, audio bool) (result domain.StreamResult, ok bool, err error) {
-	vendor, vendorParams := "", map[string]string(nil)
+// vendorFor resolves which vendor owns a bus and with what params — first
+// config/buses.json (a manual pin, or the only option for a vendor with no
+// listing API, like N9M/Castmaster), then falling back to the vendor roster
+// (Chemito's device list, Sumith's vehicle list) so a bus that's only
+// auto-discovered can still be started on-demand, not just displayed.
+// ok=false means the bus isn't findable either way — not a failure, just
+// nothing to do.
+func (u *unifiedBridgeServer) vendorFor(ctx context.Context, bus string) (vendor string, vendorParams map[string]string, ok bool) {
 	if busCfg, configured := u.buses[bus]; configured {
-		vendor, vendorParams = busCfg.Vendor, busCfg.VendorParams
-	} else if v, params, found := u.stream.RosterVendor(ctx, bus); found {
-		vendor, vendorParams = v, params
-	} else {
+		return busCfg.Vendor, busCfg.VendorParams, true
+	}
+	if v, params, found := u.stream.RosterVendor(ctx, bus); found {
+		return v, params, true
+	}
+	return "", nil, false
+}
+
+// startBus is the shared core behind handleStart and ensureStream.
+func (u *unifiedBridgeServer) startBus(ctx context.Context, bus string, cam int, main, audio bool) (result domain.StreamResult, ok bool, err error) {
+	vendor, vendorParams, ok := u.vendorFor(ctx, bus)
+	if !ok {
 		return domain.StreamResult{}, false, nil
 	}
 	result, err = u.stream.StartStream(ctx, domain.StreamRequest{
@@ -226,10 +233,64 @@ func (u *unifiedBridgeServer) handleFLVProxy(w http.ResponseWriter, r *http.Requ
 		return
 	}
 
+	// Quality is the caller's choice, because a grid and a fullscreen view
+	// want opposite things. ?sub=1 asks the device for its sub-stream and
+	// ?audio=0 drops the audio track:
+	//
+	//   grid tile   ?sub=1&audio=0   small, fast to start, cheap to decode
+	//   fullscreen  (no params)      main stream with audio, as before
+	//
+	// Measured on DLPD8611: main streams run 1920x1080 to 2880x1620 at
+	// ~150KB/s each, so nine of them in a grid is ~1.3MB/s and nine HD
+	// decodes for tiles a few hundred pixels wide. Audio adds its own
+	// problem on these cameras — timestamp gaps the remuxer has to paper
+	// over with silent frames, which delays the first frame.
+	//
+	// Defaults are the old behaviour exactly, so existing URLs are unchanged.
+	upstream, hasAudio, variant := entry.Upstream, entry.HasAudio, ""
+	sub := r.URL.Query().Get("sub") == "1"
+	audio := r.URL.Query().Get("audio") != "0"
+	if sub || !audio {
+		variant = flvVariant(sub, audio)
+		vendor, vendorParams, found := u.vendorFor(r.Context(), bus)
+		if !found {
+			http.Error(w, fmt.Sprintf("bus %q is not configured for bridging", bus), http.StatusNotFound)
+			return
+		}
+		// Resolved per request rather than taken from the registry: the
+		// registry's resolver carries whatever quality was asked for first,
+		// and this viewer wants a different one. Cheap for Chemito — the
+		// resolver is a closure, the vendor is not called until the hub
+		// connects (vendors/chemitoapi.Adapter.ResolveLiveSource).
+		src, err := u.stream.UpstreamFor(r.Context(), domain.StreamRequest{
+			Bus: bus, Cam: cam, Vendor: vendor, Main: !sub, Audio: audio, VendorParams: vendorParams,
+		})
+		if err != nil {
+			writeBridgeError(w, err)
+			return
+		}
+		upstream, hasAudio = src.Upstream, src.HasAudio
+	}
+
 	// Everything past here — connecting, reconnecting, holding the viewer
 	// open across a vendor outage — belongs to the hub, which shares one
-	// device session across every viewer of this camera.
-	u.hub.serve(w, r, key, entry.Upstream, entry.HasAudio)
+	// device session across every viewer of this camera at this quality.
+	u.hub.serveVariant(w, r, key, variant, upstream, hasAudio)
+}
+
+// flvVariant names a quality for the hub's channel map and for GET /api/hub.
+// "" is main stream with audio, so the default costs no extra channel.
+func flvVariant(sub, audio bool) string {
+	switch {
+	case sub && !audio:
+		return "sub,noaudio"
+	case sub:
+		return "sub"
+	case !audio:
+		return "noaudio"
+	default:
+		return ""
+	}
 }
 
 // stallReader fails a Read that produces nothing for timeout, so a vendor

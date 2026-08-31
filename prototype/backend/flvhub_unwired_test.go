@@ -5,6 +5,7 @@ import (
 	"context"
 	"net/http"
 	"net/http/httptest"
+	"sync"
 	"testing"
 	"time"
 )
@@ -222,7 +223,7 @@ func TestFLVHubLiveVideoClearsTheUnwiredMark(t *testing.T) {
 
 	// serve() would refuse a marked key outright, so drive the channel the
 	// way a resumed attempt does once the mark has expired.
-	c := hub.channel("BUS_4", func(context.Context) (string, error) { return live.URL, nil }, false)
+	c := hub.channel("BUS_4", "", func(context.Context) (string, error) { return live.URL, nil }, false)
 	// Stop the upstream before live.Close(), which otherwise waits on it.
 	defer c.cancel()
 
@@ -232,5 +233,84 @@ func TestFLVHubLiveVideoClearsTheUnwiredMark(t *testing.T) {
 	}
 	if hub.Unwired("BUS_4") {
 		t.Fatal("channel delivered video and is still marked as having no camera")
+	}
+}
+
+// A grid tile on the device's sub-stream and a fullscreen viewer on the main
+// stream are two different vendor connections of one camera. They must not
+// share a channel — sharing means whoever connects first decides everyone's
+// quality — and the rest of the system must still see one camera, not two,
+// or GET /api/fleet starts reporting cams that don't exist.
+func TestFLVHubVariantsAreSeparateChannelsOfOneCamera(t *testing.T) {
+	var mu sync.Mutex
+	asked := map[string]int{}
+	stream := func(name string) *httptest.Server {
+		return httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+			mu.Lock()
+			asked[name]++
+			mu.Unlock()
+			_, _ = w.Write([]byte(flvHeader))
+			_, _ = w.Write(flvTag(0x09, []byte("\x17\x00\x00\x00\x00config")))
+			if f, ok := w.(http.Flusher); ok {
+				f.Flush()
+			}
+			<-r.Context().Done()
+		}))
+	}
+	main, sub := stream("main"), stream("sub")
+	defer main.Close()
+	defer sub.Close()
+
+	hub := newFLVHub()
+	hub.idleGrace = time.Millisecond
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+
+	req := func(path string) *http.Request {
+		return httptest.NewRequest(http.MethodGet, path, nil).WithContext(ctx)
+	}
+	go hub.serveVariant(&discardWriter{}, req("/api/flv/BUS_1"), "BUS_1", "",
+		func(context.Context) (string, error) { return main.URL, nil }, true)
+	go hub.serveVariant(&discardWriter{}, req("/api/flv/BUS_1?sub=1&audio=0"), "BUS_1", "sub,noaudio",
+		func(context.Context) (string, error) { return sub.URL, nil }, false)
+
+	deadline := time.Now().Add(10 * time.Second)
+	for time.Now().Before(deadline) {
+		mu.Lock()
+		both := asked["main"] > 0 && asked["sub"] > 0
+		mu.Unlock()
+		if both {
+			break
+		}
+		time.Sleep(20 * time.Millisecond)
+	}
+	mu.Lock()
+	gotMain, gotSub := asked["main"], asked["sub"]
+	mu.Unlock()
+	if gotMain == 0 || gotSub == 0 {
+		t.Fatalf("main asked %d times, sub %d — each quality needs its own upstream", gotMain, gotSub)
+	}
+
+	hub.mu.Lock()
+	channels := len(hub.chans)
+	hub.mu.Unlock()
+	if channels != 2 {
+		t.Fatalf("hub holds %d channels, want 2 (one per quality)", channels)
+	}
+
+	// One camera, whichever quality is streaming: this is what the fleet
+	// view reads, and it must not double-count or miss a sub-only tile.
+	if live, known := hub.Live("BUS_1"); !known || !live {
+		t.Fatalf("Live(BUS_1) = (%v, %v), want live and known", live, known)
+	}
+	seen := map[string]bool{}
+	for _, s := range hub.stats() {
+		if s.Key != "BUS_1" {
+			t.Fatalf("stats reported key %q, want the camera key without the quality", s.Key)
+		}
+		seen[s.Variant] = true
+	}
+	if !seen[""] || !seen["sub,noaudio"] {
+		t.Fatalf("hub stats variants = %v, want both the main and sub lines", seen)
 	}
 }

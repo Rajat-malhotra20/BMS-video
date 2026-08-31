@@ -52,6 +52,21 @@ func newFLVHub() *flvHub {
 	}
 }
 
+// chanID is the hub's internal map key: one entry per {camera, variant}.
+//
+// A camera can be watched at two qualities at once — a grid tile on the
+// device's sub-stream and someone's fullscreen view on the main stream —
+// and those are two different vendor connections, so they cannot share a
+// channel. The variant stays inside the hub: every other part of the system
+// (the fleet view, the direct-entry registry, the unwired memory) works on
+// the plain {bus}_{cam} key, because "which camera" is what they are about.
+func chanID(key, variant string) string {
+	if variant == "" {
+		return key
+	}
+	return key + "|" + variant
+}
+
 // Live reports whether key currently has an upstream that has produced
 // playable video, and whether the hub has a channel for it at all.
 //
@@ -61,16 +76,28 @@ func newFLVHub() *flvHub {
 // channel is streaming" — which is how the fleet view came to list cams 8
 // and 9 of DLPD8611 as live when they have no camera at all. The hub is the
 // only component that connects, so it is the only one that knows.
+// Any variant counts: a camera being watched only as a grid tile on the
+// sub-stream is every bit as live as one on the main stream, and the fleet
+// view asks about cameras, not qualities.
 func (h *flvHub) Live(key string) (live, known bool) {
 	h.mu.Lock()
-	c, ok := h.chans[key]
-	h.mu.Unlock()
-	if !ok {
-		return false, false
+	chans := make([]*flvChannel, 0, 2)
+	for _, c := range h.chans {
+		if c.key == key {
+			chans = append(chans, c)
+		}
 	}
-	c.mu.RLock()
-	defer c.mu.RUnlock()
-	return c.baseHdr != nil, true
+	h.mu.Unlock()
+
+	for _, c := range chans {
+		c.mu.RLock()
+		streaming := c.baseHdr != nil
+		c.mu.RUnlock()
+		if streaming {
+			return true, true
+		}
+	}
+	return false, len(chans) > 0
 }
 
 // markUnwired records that key has no camera behind it.
@@ -110,11 +137,11 @@ func (h *flvHub) siblingLive(key string) bool {
 	}
 	h.mu.Lock()
 	defer h.mu.Unlock()
-	for k, c := range h.chans {
-		if k == key {
-			continue
+	for _, c := range h.chans {
+		if c.key == key {
+			continue // this channel, at any quality, proves nothing about itself
 		}
-		if b, _, ok := parseBusPath(k); !ok || b != bus {
+		if b, _, ok := parseBusPath(c.key); !ok || b != bus {
 			continue
 		}
 		c.mu.RLock()
@@ -235,11 +262,16 @@ type flvSub struct {
 	ch chan []byte
 }
 
-// flvChannel is one {bus}_{cam}: a single upstream reader broadcasting to
-// every subscriber.
+// flvChannel is one {bus}_{cam} at one quality: a single upstream reader
+// broadcasting to every subscriber.
 type flvChannel struct {
-	hub      *flvHub
-	key      string
+	hub *flvHub
+	key string
+	// variant names the quality this channel carries — "" for the device's
+	// main stream with audio, otherwise something like "sub" or
+	// "sub,noaudio". Empty is the default so an existing URL keeps its
+	// existing behaviour.
+	variant  string
 	resolve  func(context.Context) (string, error)
 	hasAudio bool
 	cancel   context.CancelFunc
@@ -278,20 +310,30 @@ type flvChannel struct {
 	lastOutTS uint32
 }
 
-// serve attaches one viewer to key's channel, starting the channel if this
-// is the first viewer. It returns only when the viewer disconnects.
+// serve attaches one viewer to key's main-stream channel. Kept as the
+// default so every existing caller and URL behaves exactly as before.
 func (h *flvHub) serve(w http.ResponseWriter, r *http.Request, key string, resolve func(context.Context) (string, error), hasAudio bool) {
+	h.serveVariant(w, r, key, "", resolve, hasAudio)
+}
+
+// serveVariant attaches one viewer to key's channel at one quality,
+// starting that channel if this is the first viewer of it. It returns only
+// when the viewer disconnects.
+func (h *flvHub) serveVariant(w http.ResponseWriter, r *http.Request, key, variant string, resolve func(context.Context) (string, error), hasAudio bool) {
 	// A channel already proven to have no camera is refused here rather
 	// than by trying again: a bookmarked tile retrying every few seconds
 	// would otherwise keep spending the device's concurrent sessions on a
 	// connection that always EOFs. Same 502 and same text either way, so
 	// a client cannot tell this shortcut from the real attempt.
+	//
+	// Keyed by camera, not by quality: no camera behind channel 9 is true
+	// of its sub-stream as well.
 	if h.Unwired(key) {
 		http.Error(w, fmt.Sprintf("%s: %v", key, errUnwired), http.StatusBadGateway)
 		return
 	}
 
-	c := h.channel(key, resolve, hasAudio)
+	c := h.channel(key, variant, resolve, hasAudio)
 
 	// Wait for something playable. This is the ONLY point at which a
 	// viewer can be refused — past it, the connection is held open no
@@ -362,28 +404,40 @@ func (h *flvHub) serve(w http.ResponseWriter, r *http.Request, key string, resol
 	}
 }
 
-// channel returns key's channel, creating and starting it if needed, and
-// counts this caller as one holder (released via release).
-func (h *flvHub) channel(key string, resolve func(context.Context) (string, error), hasAudio bool) *flvChannel {
+// channel returns key's channel at the given quality, creating and starting
+// it if needed, and counts this caller as one holder (released via release).
+func (h *flvHub) channel(key, variant string, resolve func(context.Context) (string, error), hasAudio bool) *flvChannel {
 	h.mu.Lock()
 	defer h.mu.Unlock()
 
-	if c, ok := h.chans[key]; ok {
+	id := chanID(key, variant)
+	if c, ok := h.chans[id]; ok {
 		c.hold()
 		return c
 	}
 	ctx, cancel := context.WithCancel(context.Background())
 	c := &flvChannel{
-		hub: h, key: key, resolve: resolve, hasAudio: hasAudio, cancel: cancel,
+		hub: h, key: key, variant: variant, resolve: resolve, hasAudio: hasAudio, cancel: cancel,
 		ready:         make(chan struct{}),
 		deadOnArrival: make(chan struct{}),
 		subs:          make(map[*flvSub]struct{}),
 		startedAt:     time.Now(),
 	}
 	c.holders = 1
-	h.chans[key] = c
+	h.chans[id] = c
 	go c.run(ctx)
 	return c
+}
+
+// id is this channel's key in the hub's map: camera plus quality.
+func (c *flvChannel) id() string { return chanID(c.key, c.variant) }
+
+// label is how this channel is named in logs and GET /api/hub.
+func (c *flvChannel) label() string {
+	if c.variant == "" {
+		return c.key
+	}
+	return c.key + " (" + c.variant + ")"
 }
 
 // release drops one holder and, once nobody is left, stops the upstream
@@ -403,12 +457,12 @@ func (h *flvHub) release(c *flvChannel) {
 		c.mu.RLock()
 		stillIdle := c.holders == 0
 		c.mu.RUnlock()
-		if !stillIdle || h.chans[c.key] != c {
+		if !stillIdle || h.chans[c.id()] != c {
 			return
 		}
-		delete(h.chans, c.key)
+		delete(h.chans, c.id())
 		c.cancel()
-		log.Printf("flv hub: %s: no viewers, released device session", c.key)
+		log.Printf("flv hub: %s: no viewers, released device session", c.label())
 	})
 }
 
@@ -483,7 +537,7 @@ func (c *flvChannel) noteErr(err error) {
 	if live {
 		// Already played once: viewers stay attached on heartbeats while
 		// the loop reconnects. Not an error the viewer needs to see.
-		log.Printf("flv hub: %s: upstream dropped, reconnecting: %v", c.key, err)
+		log.Printf("flv hub: %s: upstream dropped, reconnecting: %v", c.label(), err)
 		return
 	}
 	// Never produced a frame and the device EOF'd on connect. That is a
@@ -832,7 +886,12 @@ func buildKeepAliveTag() []byte {
 
 // hubChannelStat is one channel's line in GET /api/hub.
 type hubChannelStat struct {
-	Key         string `json:"key"`
+	Key string `json:"key"`
+	// Variant is the quality this channel carries — omitted for the main
+	// stream. Two lines can share a Key: a grid on the sub-stream and a
+	// fullscreen viewer on the main stream are two device sessions, and
+	// anyone diagnosing session pressure needs to see both.
+	Variant     string `json:"variant,omitempty"`
 	Viewers     int    `json:"viewers"`
 	Live        bool   `json:"live"`
 	UptimeSec   int    `json:"uptimeSec"`
@@ -859,6 +918,7 @@ func (h *flvHub) stats() []hubChannelStat {
 		c.mu.RLock()
 		stat := hubChannelStat{
 			Key:         c.key,
+			Variant:     c.variant,
 			Viewers:     len(c.subs),
 			Live:        c.baseHdr != nil,
 			UptimeSec:   int(time.Since(c.startedAt).Seconds()),
@@ -872,6 +932,11 @@ func (h *flvHub) stats() []hubChannelStat {
 		c.mu.RUnlock()
 		out = append(out, stat)
 	}
-	sort.Slice(out, func(i, j int) bool { return out[i].Key < out[j].Key })
+	sort.Slice(out, func(i, j int) bool {
+		if out[i].Key != out[j].Key {
+			return out[i].Key < out[j].Key
+		}
+		return out[i].Variant < out[j].Variant
+	})
 	return out
 }
