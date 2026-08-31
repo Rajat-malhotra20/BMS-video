@@ -11,6 +11,7 @@ import (
 	"testing"
 
 	"mediamtx-console/domain"
+	"mediamtx-console/services"
 )
 
 func TestFleetHandler(t *testing.T) {
@@ -337,5 +338,83 @@ func TestParseBusPathTwoDigitCam(t *testing.T) {
 	}
 	if _, _, ok := parseBusPath("DL1PC0001_01"); ok {
 		t.Fatalf("leading-zero cam should not parse")
+	}
+}
+
+// GET /api/fleet must report the cameras that are streaming, not the ones
+// somebody once started. The direct-entry registry only records starts (it
+// is cleared by an explicit stop and nothing else), so on its own it
+// reported cams 8 and 9 of DLPD8611 as online — channel numbers the DVR
+// offers with no camera behind them — and contradicted GET /api/hub, which
+// showed no such channels at all.
+func TestFleetLivenessComesFromTheHubNotTheRegistry(t *testing.T) {
+	mtx := fakeIngest(`[]`)
+	defer mtx.Close()
+
+	api := newAPIServer(mtx.URL)
+	api.directKeys = func() []services.DirectEntry {
+		return []services.DirectEntry{
+			{Key: "BUS_1", Kind: domain.KindFLV, HLSURL: "/api/flv/BUS_1"}, // streaming
+			{Key: "BUS_8", Kind: domain.KindFLV, HLSURL: "/api/flv/BUS_8"}, // started, never delivered a frame
+			{Key: "BUS_9", Kind: domain.KindFLV, HLSURL: "/api/flv/BUS_9"}, // no channel at all
+		}
+	}
+	api.flvLive = func(key string) (live, known bool) {
+		switch key {
+		case "BUS_1":
+			return true, true
+		case "BUS_8":
+			return false, true
+		default:
+			return false, false
+		}
+	}
+
+	rec := httptest.NewRecorder()
+	api.handleFleet(rec, httptest.NewRequest("GET", "/api/fleet", nil))
+	if rec.Code != http.StatusOK {
+		t.Fatalf("status = %d, want 200", rec.Code)
+	}
+	var got fleetSummary
+	if err := json.Unmarshal(rec.Body.Bytes(), &got); err != nil {
+		t.Fatalf("bad json: %v", err)
+	}
+	if len(got.Buses) != 1 {
+		t.Fatalf("buses = %+v, want exactly BUS", got.Buses)
+	}
+	if fmt.Sprint(got.Buses[0].Cams) != "[1]" {
+		t.Fatalf("cams = %v, want [1] — only the channel actually streaming", got.Buses[0].Cams)
+	}
+	if got.Totals.CamsOnline != 1 {
+		t.Fatalf("camsOnline = %d, want 1", got.Totals.CamsOnline)
+	}
+}
+
+// camsAvailable is the only field a dashboard can use to answer "does this
+// bus have cameras" without opening a vendor session — cams is empty
+// whenever nobody is watching. So it must not promise cameras the device
+// has already refused: these DVRs report 9 channels and wire 7.
+func TestCamsAvailableExcludesProvenEmptyChannels(t *testing.T) {
+	mtx := fakeIngest(`[]`)
+	defer mtx.Close()
+
+	api := newAPIServer(mtx.URL)
+	api.channelCounts = func(context.Context) map[string]int { return map[string]int{"BUS": 9} }
+	api.vendorRoster = func(context.Context) []services.RosterEntry {
+		return []services.RosterEntry{{Key: "BUS_1", Online: true}}
+	}
+	api.unwired = func(key string) bool { return key == "BUS_8" || key == "BUS_9" }
+
+	rec := httptest.NewRecorder()
+	api.handleFleet(rec, httptest.NewRequest("GET", "/api/fleet", nil))
+	var got fleetSummary
+	if err := json.Unmarshal(rec.Body.Bytes(), &got); err != nil {
+		t.Fatalf("bad json: %v", err)
+	}
+	if len(got.Buses) != 1 {
+		t.Fatalf("buses = %+v, want one", got.Buses)
+	}
+	if got.Buses[0].CamsAvailable != 7 {
+		t.Fatalf("camsAvailable = %d, want 7 (9 reported, 8 and 9 proven empty)", got.Buses[0].CamsAvailable)
 	}
 }

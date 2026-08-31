@@ -49,6 +49,18 @@ type apiServer struct {
 	// StreamService.ChannelCounts) since it rarely changes.
 	channelCounts func(ctx context.Context) map[string]int
 
+	// unwired, if set, reports a {bus}_{cam} the device has already proven
+	// has no camera on it (see flvHub.Unwired). The vendor's channel count
+	// is a slot count, not a camera count, and offering the empty slots
+	// costs real sessions on a device that has few.
+	unwired func(key string) bool
+
+	// flvLive, if set, reports whether an FLV key has an upstream that has
+	// actually produced video, and whether the hub knows the key at all
+	// (see flvHub.Live). The direct-entry registry cannot answer this: it
+	// records what was started, not what is streaming.
+	flvLive func(key string) (live, known bool)
+
 	cacheMu     sync.Mutex
 	cachedFleet *fleetSummary
 	cachedPaths []ingestPath
@@ -75,11 +87,20 @@ func newAPIServer(ingestBase string) *apiServer {
 }
 
 // directPaths turns currently-active non-RTSP vendor sessions into
-// synthetic ingestPath entries (Ready=true, no tracks/bytes) so
-// fleetTracker.build can fold them into the fleet summary using the same
-// {bus}_{cam} parsing it already applies to real MediaMTX paths.
-// DirectKind carries which kind (embed/hls) so camDetail/streamInfo can
-// report it accurately instead of assuming "embed" for anything synthetic.
+// synthetic ingestPath entries (no tracks/bytes) so fleetTracker.build can
+// fold them into the fleet summary using the same {bus}_{cam} parsing it
+// already applies to real MediaMTX paths. DirectKind carries which kind
+// (embed/hls/flv) so camDetail/streamInfo can report it accurately instead
+// of assuming "embed" for anything synthetic.
+//
+// Ready is the part that needs care. A direct entry is registered when a
+// stream is started and dropped only by an explicit stop, so its presence
+// means "someone started this once", not "video is flowing". For FLV the
+// hub holds the upstream and therefore knows the difference — so ask it,
+// and a channel it has never got a frame from (an unwired channel number, a
+// device that stopped answering) stops being counted as a live camera.
+// Without this GET /api/fleet reported cams 8 and 9 of DLPD8611 as online
+// with nothing behind them, and disagreed with GET /api/hub.
 func (a *apiServer) directPaths() []ingestPath {
 	if a.directKeys == nil {
 		return nil
@@ -91,7 +112,14 @@ func (a *apiServer) directPaths() []ingestPath {
 		if url == "" {
 			url = e.HLSURL
 		}
-		paths[i] = ingestPath{Name: e.Key, Ready: true, DirectKind: string(e.Kind), DirectURL: url}
+		ready := true
+		if e.Kind == domain.KindFLV && a.flvLive != nil {
+			// known=false means no channel at all: nobody is watching, so
+			// there is no session and nothing to call live.
+			live, known := a.flvLive(e.Key)
+			ready = known && live
+		}
+		paths[i] = ingestPath{Name: e.Key, Ready: ready, DirectKind: string(e.Kind), DirectURL: url}
 	}
 	return paths
 }
@@ -249,6 +277,33 @@ func (a *apiServer) snapshot() (*fleetSummary, []ingestPath, error) {
 	return a.cachedFleet, a.cachedPaths, nil
 }
 
+// unwiredCams counts how many of bus's first n channel numbers have been
+// proven to have no camera on them.
+//
+// This is what makes camsAvailable answerable by a frontend. The vendor
+// reports a slot count, not a camera count — 9 on these DVRs, of which 7
+// are real — so a dashboard rendering camsAvailable directly promises two
+// cameras that do not exist, and the only other signal it has (cams) is
+// empty whenever nobody happens to be watching. Subtracting what the device
+// itself has refused means "does this bus have cameras, and how many" can be
+// answered without opening a single vendor session.
+//
+// The memory expires (flvUnwiredMemory), so a count can drift back up until
+// the empty channel is proven again. That is the right direction to be
+// wrong in: a camera newly wired to channel 8 appears on its own.
+func (a *apiServer) unwiredCams(bus string, n int) int {
+	if a.unwired == nil || n <= 0 {
+		return 0
+	}
+	dead := 0
+	for cam := 1; cam <= n; cam++ {
+		if a.unwired(bus + "_" + strconv.Itoa(cam)) {
+			dead++
+		}
+	}
+	return dead
+}
+
 // fleetSummaryWithCounts is handleFleet's and handleFleetStream's shared
 // core: the cached fleet snapshot, annotated with each bus's camsAvailable
 // count.
@@ -267,7 +322,7 @@ func (a *apiServer) fleetSummaryWithCounts(ctx context.Context) (fleetSummary, e
 		buses := make([]fleetBus, len(out.Buses))
 		copy(buses, out.Buses)
 		for i := range buses {
-			buses[i].CamsAvailable = counts[buses[i].ID]
+			buses[i].CamsAvailable = counts[buses[i].ID] - a.unwiredCams(buses[i].ID, counts[buses[i].ID])
 		}
 		out.Buses = buses
 	}
@@ -527,6 +582,14 @@ func (a *apiServer) ensureAllCams(ctx context.Context, bus string, have []stream
 			continue
 		}
 		key := bus + "_" + strconv.Itoa(cam)
+
+		// A channel the device has already EOF'd on is not a camera. It
+		// would fail the same way every time, and each attempt spends one
+		// of the device's few concurrent sessions — the ones the working
+		// cameras need.
+		if a.unwired != nil && a.unwired(key) {
+			continue
+		}
 
 		// Check the live session map before starting: the fleet snapshot
 		// this result was built from is up to 2s stale, so a channel

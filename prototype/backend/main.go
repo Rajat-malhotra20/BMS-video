@@ -143,6 +143,13 @@ func main() {
 	api.vendorRoster = streamSvc.VendorRoster
 	api.channelCounts = streamSvc.ChannelCounts
 
+	// ...minus the channel numbers that turned out to have no camera on
+	// them, and with FLV liveness answered by the hub rather than by the
+	// registry of what was once started. Only the hub can know either —
+	// it is the thing that connects.
+	api.unwired = ubrs.hub.Unwired
+	api.flvLive = ubrs.hub.Live
+
 	// GET /api/stream/{id}?cam=N starts the bridge on demand if it isn't
 	// already active — the frontend never has to call
 	// POST /api/bridge/start itself; that endpoint is internal now (kept
@@ -202,6 +209,25 @@ func main() {
 			"endpoints": endpoints,
 		})
 	})
+
+	// Log in to the vendors at boot instead of making the first viewer pay
+	// for it. ChannelCounts sweeps every adapter's device list, which is
+	// what mints the shared verify key
+	// (vendors/chemitoapi.Adapter.session) and fills the roster and
+	// channel-count caches — so the first tile opened after a redeploy
+	// connects straight to the device.
+	//
+	// In a goroutine, with errors only logged: a vendor unreachable at boot
+	// must not delay this process serving /health, nor the buses belonging
+	// to vendors that are fine. The lazy path is still there — the next
+	// request that needs a key mints one.
+	go func() {
+		ctx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
+		defer cancel()
+		started := time.Now()
+		counts := streamSvc.ChannelCounts(ctx)
+		log.Printf("vendor warm-up: %d bus(es) known, in %s", len(counts), time.Since(started).Round(time.Millisecond))
+	}()
 
 	server := &http.Server{
 		Addr:              cfg.addr,

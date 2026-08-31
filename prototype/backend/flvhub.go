@@ -2,6 +2,7 @@ package main
 
 import (
 	"context"
+	"errors"
 	"fmt"
 	"io"
 	"log"
@@ -35,10 +36,71 @@ type flvHub struct {
 
 	mu    sync.Mutex
 	chans map[string]*flvChannel
+
+	// unwired remembers channels the device answered with an immediate EOF
+	// — a channel number it reports but has no camera on. Keyed by
+	// {bus}_{cam}, valued at when it was last proven so the memory expires
+	// if a camera is ever installed. See flvUnwiredMemory.
+	unwired map[string]time.Time
 }
 
 func newFLVHub() *flvHub {
-	return &flvHub{idleGrace: flvIdleGrace, chans: make(map[string]*flvChannel)}
+	return &flvHub{
+		idleGrace: flvIdleGrace,
+		chans:     make(map[string]*flvChannel),
+		unwired:   make(map[string]time.Time),
+	}
+}
+
+// Live reports whether key currently has an upstream that has produced
+// playable video, and whether the hub has a channel for it at all.
+//
+// This is what /api/fleet and /api/bus need to stop lying. A direct entry
+// is registered when a stream is started and removed only by an explicit
+// stop, so on its own it says "this channel was started once", not "this
+// channel is streaming" — which is how the fleet view came to list cams 8
+// and 9 of DLPD8611 as live when they have no camera at all. The hub is the
+// only component that connects, so it is the only one that knows.
+func (h *flvHub) Live(key string) (live, known bool) {
+	h.mu.Lock()
+	c, ok := h.chans[key]
+	h.mu.Unlock()
+	if !ok {
+		return false, false
+	}
+	c.mu.RLock()
+	defer c.mu.RUnlock()
+	return c.baseHdr != nil, true
+}
+
+// markUnwired records that key has no camera behind it.
+func (h *flvHub) markUnwired(key string) {
+	h.mu.Lock()
+	h.unwired[key] = time.Now()
+	h.mu.Unlock()
+}
+
+// Unwired reports whether key was recently proven to have no camera on it.
+//
+// This exists because these DVRs report more channels than they have
+// cameras (9 reported, 7 wired — confirmed live 2026-08-26 on DL1PD8584
+// and 2026-08-31 on DLPD8611), and every attempt on an unwired one still
+// costs a connection against the device's small concurrent-session budget.
+// Measured on DLPD8611: while channels 8 and 9 retried, working channels 6
+// and 7 were refused with HTTP 408 "out of concurrent sessions". Not
+// offering a channel that cannot work is what keeps the ones that can.
+func (h *flvHub) Unwired(key string) bool {
+	h.mu.Lock()
+	defer h.mu.Unlock()
+	at, ok := h.unwired[key]
+	if !ok {
+		return false
+	}
+	if time.Since(at) > flvUnwiredMemory {
+		delete(h.unwired, key)
+		return false
+	}
+	return true
 }
 
 const (
@@ -49,9 +111,22 @@ const (
 	// reference across viewers, so this bounds queue depth, not copies.
 	flvSubBuffer = 256
 
-	// flvIdleGrace keeps the upstream alive briefly after the last viewer
-	// leaves — reloading a page shouldn't cost a new device session.
-	flvIdleGrace = 10 * time.Second
+	// flvIdleGrace keeps the upstream alive after the last viewer leaves —
+	// reloading a page shouldn't cost a new device session.
+	//
+	// A minute, not the 10s it was: re-opening is the expensive operation,
+	// not staying open. Measured on DLPD8611 2026-08-31, a page reload
+	// released channels 6 and 7, and re-opening them 10s later was refused
+	// with HTTP 408 "out of concurrent sessions" — the device had not yet
+	// let go of the session we just abandoned. Holding the connection we
+	// already have costs the same one session and skips that race.
+	flvIdleGrace = 60 * time.Second
+
+	// flvUnwiredMemory is how long a channel proven to have no camera is
+	// left out of listings before it is offered again. Long enough to stop
+	// a wall display retrying it all day, short enough that a camera
+	// installed on that channel shows up without a redeploy.
+	flvUnwiredMemory = 10 * time.Minute
 
 	// flvReconnectMin/Max bound the single reconnect loop. Fast first
 	// (a moving vehicle's signal blip is over in well under a second),
@@ -101,6 +176,12 @@ const (
 	// carries a 24-bit size, but a real tag is orders of magnitude smaller.
 	flvMaxTagSize = 16 << 20
 )
+
+// errUnwired is the connect-time EOF that means this channel number exists
+// on the device but has no camera on it. Its text is what a viewer sees in
+// the 502 body, so a frontend can tell "never going to work" apart from
+// "having a bad minute" without parsing status codes.
+var errUnwired = errors.New("vendor closed the stream connection (channel may not be wired to a camera)")
 
 // flvSub is one attached viewer.
 type flvSub struct {
@@ -153,6 +234,16 @@ type flvChannel struct {
 // serve attaches one viewer to key's channel, starting the channel if this
 // is the first viewer. It returns only when the viewer disconnects.
 func (h *flvHub) serve(w http.ResponseWriter, r *http.Request, key string, resolve func(context.Context) (string, error), hasAudio bool) {
+	// A channel already proven to have no camera is refused here rather
+	// than by trying again: a bookmarked tile retrying every few seconds
+	// would otherwise keep spending the device's concurrent sessions on a
+	// connection that always EOFs. Same 502 and same text either way, so
+	// a client cannot tell this shortcut from the real attempt.
+	if h.Unwired(key) {
+		http.Error(w, fmt.Sprintf("%s: %v", key, errUnwired), http.StatusBadGateway)
+		return
+	}
+
 	c := h.channel(key, resolve, hasAudio)
 
 	// Wait for something playable. This is the ONLY point at which a
@@ -348,6 +439,12 @@ func (c *flvChannel) noteErr(err error) {
 		log.Printf("flv hub: %s: upstream dropped, reconnecting: %v", c.key, err)
 		return
 	}
+	// Never produced a frame and the device EOF'd on connect: this channel
+	// has no camera. Remember it so listings stop offering it and nobody
+	// spends device sessions retrying it.
+	if errors.Is(err, errUnwired) {
+		c.hub.markUnwired(c.key)
+	}
 	c.deadOnce.Do(func() { close(c.deadOnArrival) })
 }
 
@@ -367,8 +464,9 @@ func (c *flvChannel) pumpOnce(ctx context.Context) (delivered bool, err error) {
 	if err != nil {
 		// Immediate EOF here is the relay accepting the TCP connection and
 		// dropping it — in practice a channel with no camera wired to it,
-		// distinct from the 408 below.
-		return false, fmt.Errorf("vendor closed the stream connection (channel may not be wired to a camera): %w", err)
+		// distinct from the 408 below. errUnwired is what tells noteErr to
+		// stop offering this channel; the wrapped err keeps the detail.
+		return false, fmt.Errorf("%w: %w", errUnwired, err)
 	}
 	defer resp.Body.Close()
 	if resp.StatusCode != http.StatusOK {
@@ -562,8 +660,17 @@ func (c *flvChannel) publishTag(tagType byte, data, tag []byte) {
 	switch {
 	case tagType == 0x12: // script data — onMetaData
 		c.script = tag
-	case tagType == 0x09 && len(data) >= 2 && data[0]&0x0F == 7 && data[1] == 0:
-		c.videoSeq = tag // AVC decoder configuration record
+	// Codec 7 is H.264, codec 12 is H.265 — the same tag layout, and both
+	// use packet type 0 for the decoder configuration record. Matching only
+	// codec 7 (as this did) meant an H.265 camera's configuration fell
+	// through to the keyframe case below, where the next keyframe promptly
+	// overwrote it. The first viewer, who saw it arrive live, played fine;
+	// everyone who joined afterwards got keyframes with nothing to decode
+	// them against and a black tile that never errored. Confirmed live
+	// 2026-08-31: DLPD8611 cams 6 and 7 are H.265, cams 1-5 H.264, and only
+	// 6 and 7 kept going dark.
+	case tagType == 0x09 && len(data) >= 2 && (data[0]&0x0F == 7 || data[0]&0x0F == 12) && data[1] == 0:
+		c.videoSeq = tag // AVC/HEVC decoder configuration record
 	case tagType == 0x08 && len(data) >= 2 && data[1] == 0:
 		c.audioSeq = tag // AAC sequence header
 	case tagType == 0x09 && len(data) >= 1 && data[0]>>4 == 1:
@@ -614,7 +721,27 @@ func (c *flvChannel) fanout(b []byte) {
 func (c *flvChannel) setBase(base []byte) {
 	c.mu.Lock()
 	c.baseHdr = base
-	c.script, c.videoSeq, c.audioSeq, c.gop = nil, nil, nil, nil
+
+	// The GOP goes: those frames belong to the connection that just ended.
+	//
+	// The decoder configuration does NOT. It describes the camera, not the
+	// TCP connection, and Chemito does not reliably resend it — a reconnect
+	// can drop us into the middle of a stream that never repeats its
+	// AVCDecoderConfigurationRecord. Clearing it then left the channel
+	// permanently unplayable for anyone joining afterwards: measured
+	// 2026-08-31 on DLPD8611_6, 150KB/s of video, 13 keyframes in 12s, zero
+	// config records, every new tile black while viewers from before the
+	// reconnect kept playing. Keeping the last one costs nothing when the
+	// vendor does resend (it simply overwrites) and is the difference
+	// between a picture and a black tile when it doesn't.
+	c.gop = nil
+
+	// Audio is the exception: whether the header advertises audio is
+	// decided per connection by the probe, so a stale AAC header would
+	// contradict a header that just said this camera has no microphone.
+	if len(base) >= 5 && base[4]&0x04 == 0 {
+		c.audioSeq = nil
+	}
 	c.mu.Unlock()
 	c.markReady()
 }
