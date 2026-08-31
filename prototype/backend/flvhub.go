@@ -80,6 +80,53 @@ func (h *flvHub) markUnwired(key string) {
 	h.mu.Unlock()
 }
 
+// clearUnwired forgets any such mark, called the moment key produces video.
+func (h *flvHub) clearUnwired(key string) {
+	h.mu.Lock()
+	delete(h.unwired, key)
+	h.mu.Unlock()
+}
+
+// siblingLive reports whether another channel of the same bus is streaming
+// right now.
+//
+// This is what makes a connect-time EOF interpretable. The same EOF means
+// two different things: "this channel number has no camera" (permanent) or
+// "this device is not answering at the moment" (temporary — asleep, out of
+// coverage, relay restarting). Told apart only by context: an unwired
+// channel EOFs while its siblings stream, a sleeping device takes every
+// channel down with it.
+//
+// Getting this wrong is not theoretical. Marking on the EOF alone, deployed
+// 2026-08-31, met a DLPD8611 outage where all nine channels EOF'd, decided
+// every one of them was cameraless, and took the whole bus dark for ten
+// minutes after the device came back — camsAvailable 0, every tile told
+// "no camera on this channel", while another bus on the same account
+// streamed fine.
+func (h *flvHub) siblingLive(key string) bool {
+	bus, _, ok := parseBusPath(key)
+	if !ok {
+		return false
+	}
+	h.mu.Lock()
+	defer h.mu.Unlock()
+	for k, c := range h.chans {
+		if k == key {
+			continue
+		}
+		if b, _, ok := parseBusPath(k); !ok || b != bus {
+			continue
+		}
+		c.mu.RLock()
+		live := c.baseHdr != nil
+		c.mu.RUnlock()
+		if live {
+			return true
+		}
+	}
+	return false
+}
+
 // Unwired reports whether key was recently proven to have no camera on it.
 //
 // This exists because these DVRs report more channels than they have
@@ -439,10 +486,13 @@ func (c *flvChannel) noteErr(err error) {
 		log.Printf("flv hub: %s: upstream dropped, reconnecting: %v", c.key, err)
 		return
 	}
-	// Never produced a frame and the device EOF'd on connect: this channel
-	// has no camera. Remember it so listings stop offering it and nobody
-	// spends device sessions retrying it.
-	if errors.Is(err, errUnwired) {
+	// Never produced a frame and the device EOF'd on connect. That is a
+	// cameraless channel ONLY if the device is demonstrably answering right
+	// now — otherwise it is the whole device being unavailable, and
+	// blacklisting channels for that takes a healthy bus dark (see
+	// siblingLive). No sibling streaming means no conclusion: the reconnect
+	// loop keeps trying, which is the right behaviour for an outage.
+	if errors.Is(err, errUnwired) && c.hub.siblingLive(c.key) {
 		c.hub.markUnwired(c.key)
 	}
 	c.deadOnce.Do(func() { close(c.deadOnArrival) })
@@ -747,7 +797,13 @@ func (c *flvChannel) setBase(base []byte) {
 }
 
 func (c *flvChannel) markReady() {
-	c.readyOnce.Do(func() { close(c.ready) })
+	c.readyOnce.Do(func() {
+		close(c.ready)
+		// Video from this channel settles the question: whatever made it
+		// look cameraless before, it has a camera. Recovery must not wait
+		// out flvUnwiredMemory.
+		c.hub.clearUnwired(c.key)
+	})
 }
 
 // flvKeepAliveTag is an FLV script-data tag carrying "onKeepAlive". Players

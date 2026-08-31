@@ -33,6 +33,33 @@ func TestFLVHubUnwiredChannelIsAttemptedOnce(t *testing.T) {
 	hub := newFLVHub()
 	resolve := func(context.Context) (string, error) { return upstream.URL, nil }
 
+	// A channel of this bus that is streaming, which is what makes the EOF
+	// on BUS_8 mean "no camera here" rather than "this device is asleep".
+	live := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		_, _ = w.Write([]byte(flvHeader))
+		_, _ = w.Write(flvTag(0x09, []byte("\x17\x00\x00\x00\x00config")))
+		if f, ok := w.(http.Flusher); ok {
+			f.Flush()
+		}
+		<-r.Context().Done()
+	}))
+	defer live.Close()
+	hub.idleGrace = time.Millisecond
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+	go hub.serve(&discardWriter{}, httptest.NewRequest(http.MethodGet, "/api/flv/BUS_1", nil).WithContext(ctx),
+		"BUS_1", func(context.Context) (string, error) { return live.URL, nil }, false)
+	deadline := time.Now().Add(10 * time.Second)
+	for time.Now().Before(deadline) {
+		if l, known := hub.Live("BUS_1"); known && l {
+			break
+		}
+		time.Sleep(20 * time.Millisecond)
+	}
+	if l, known := hub.Live("BUS_1"); !known || !l {
+		t.Fatal("sibling channel never went live, test cannot distinguish the two failures")
+	}
+
 	first := &discardWriter{}
 	req := httptest.NewRequest(http.MethodGet, "/api/flv/BUS_8", nil)
 	hub.serve(first, req, "BUS_8", resolve, false)
@@ -40,7 +67,7 @@ func TestFLVHubUnwiredChannelIsAttemptedOnce(t *testing.T) {
 		t.Fatalf("first viewer status = %d, want 502", first.status())
 	}
 	if !hub.Unwired("BUS_8") {
-		t.Fatal("channel not remembered as unwired after a connect-time EOF")
+		t.Fatal("channel not remembered as unwired after a connect-time EOF beside a streaming sibling")
 	}
 
 	spent := attempts
@@ -134,5 +161,76 @@ func keepsDecoderConfig(t *testing.T, avcSeq, keyfrm string) {
 	_, backlog := c.subscribe()
 	if !bytes.Contains(backlog, []byte("config")) {
 		t.Fatal("a viewer joining after the reconnect gets no decoder configuration — its tile stays black")
+	}
+}
+
+// The failure that shipped on 2026-08-31: DLPD8611's device stopped
+// answering, every channel EOF'd on connect, and marking on the EOF alone
+// concluded that all nine channels were cameraless — camsAvailable 0, the
+// whole bus dark for ten minutes after the device recovered. An EOF with no
+// sibling streaming is a device outage and must decide nothing.
+func TestFLVHubDeviceOutageDoesNotBlacklistChannels(t *testing.T) {
+	upstream := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		conn, _, err := w.(http.Hijacker).Hijack()
+		if err != nil {
+			t.Errorf("hijack: %v", err)
+			return
+		}
+		conn.Close()
+	}))
+	defer upstream.Close()
+
+	hub := newFLVHub()
+	hub.idleGrace = time.Millisecond
+	resolve := func(context.Context) (string, error) { return upstream.URL, nil }
+
+	// Every channel of the bus is down, exactly as in the outage.
+	for _, cam := range []string{"1", "2", "3"} {
+		key := "BUS_" + cam
+		rec := &discardWriter{}
+		hub.serve(rec, httptest.NewRequest(http.MethodGet, "/api/flv/"+key, nil), key, resolve, false)
+		if rec.status() != http.StatusBadGateway {
+			t.Fatalf("%s status = %d, want 502", key, rec.status())
+		}
+	}
+	for _, cam := range []string{"1", "2", "3"} {
+		if hub.Unwired("BUS_" + cam) {
+			t.Fatalf("BUS_%s blacklisted during a whole-device outage — the bus goes dark for %s", cam, flvUnwiredMemory)
+		}
+	}
+}
+
+// And once a channel does deliver video, any earlier mark must go — a
+// camera wired up (or a device that was lying) must not wait out the TTL.
+func TestFLVHubLiveVideoClearsTheUnwiredMark(t *testing.T) {
+	hub := newFLVHub()
+	hub.idleGrace = time.Millisecond
+	hub.markUnwired("BUS_4")
+	if !hub.Unwired("BUS_4") {
+		t.Fatal("mark did not take")
+	}
+
+	live := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		_, _ = w.Write([]byte(flvHeader))
+		_, _ = w.Write(flvTag(0x09, []byte("\x17\x00\x00\x00\x00config")))
+		if f, ok := w.(http.Flusher); ok {
+			f.Flush()
+		}
+		<-r.Context().Done()
+	}))
+	defer live.Close()
+
+	// serve() would refuse a marked key outright, so drive the channel the
+	// way a resumed attempt does once the mark has expired.
+	c := hub.channel("BUS_4", func(context.Context) (string, error) { return live.URL, nil }, false)
+	// Stop the upstream before live.Close(), which otherwise waits on it.
+	defer c.cancel()
+
+	deadline := time.Now().Add(10 * time.Second)
+	for time.Now().Before(deadline) && hub.Unwired("BUS_4") {
+		time.Sleep(20 * time.Millisecond)
+	}
+	if hub.Unwired("BUS_4") {
+		t.Fatal("channel delivered video and is still marked as having no camera")
 	}
 }
