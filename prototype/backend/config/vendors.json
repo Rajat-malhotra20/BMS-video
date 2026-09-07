@@ -6,8 +6,8 @@
     "extra": { "projectId": "37" }
   },
   "chemitoapi": {
-    "baseUrl": "http://15.252.130.159:12056",
-    "username": "admin",
-    "password": "PMIDTC@1234$"
+    "baseUrl": "https://15.252.130.159:22056",
+    "username": "media-live",
+    "password": "PMIDTC@$1234"
   }
 }
