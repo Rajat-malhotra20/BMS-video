@@ -143,25 +143,18 @@ func main() {
 	api.vendorRoster = streamSvc.VendorRoster
 	api.channelCounts = streamSvc.ChannelCounts
 
-	// ...minus the channel numbers that turned out to have no camera on
-	// them, and with FLV liveness answered by the hub rather than by the
-	// registry of what was once started. Only the hub can know either —
-	// it is the thing that connects.
-	api.unwired = ubrs.hub.Unwired
-	api.flvLive = ubrs.hub.Live
+	// api.unwired and api.flvLive are left nil: both used to be answered by
+	// the FLV hub's byte-level view of each channel (did it ever connect,
+	// did a frame ever arrive), which no longer exists now that KindFLV
+	// hands the browser the vendor's own URL directly instead of a proxied
+	// connection we hold open. Every caller of these already treats nil as
+	// "unknown" (see unwiredCams, directPaths).
 
 	// GET /api/stream/{id}?cam=N starts the bridge on demand if it isn't
 	// already active — the frontend never has to call
 	// POST /api/bridge/start itself; that endpoint is internal now (kept
 	// below for admin/debug and as what this hook calls under the hood).
 	api.ensureStream = ubrs.ensureStream
-
-	// Vendor HTTP-FLV byte pipe for KindFLV sources (Chemito): the page
-	// plays this path with mpegts.js. Not MediaMTX — see handleFLVProxy.
-	mux.HandleFunc("GET /api/flv/{key}", ubrs.handleFLVProxy)
-
-	// Live view of the FLV fan-out: channels, viewers, reconnects, drops.
-	mux.HandleFunc("GET /api/hub", ubrs.handleHub)
 
 	mux.HandleFunc("POST /api/bridge/start", ubrs.handleStart)
 	// POST stop stays either way: it also drops a tracked direct (FLV/HLS)
@@ -195,8 +188,6 @@ func main() {
 			"GET /api/fleet/stream",
 			"GET /api/bus/{id}",
 			"GET /api/stream/{id}",
-			"GET /api/flv/{bus}_{cam}?sub=1&audio=0",
-			"GET /api/hub",
 			"POST /api/bridge/stop?key=",
 			"GET /health",
 		}

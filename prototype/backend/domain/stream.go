@@ -14,7 +14,7 @@ const (
 	KindRTSP  SourceKind = "rtsp"  // needs a remux job; played back via MediaMTX
 	KindEmbed SourceKind = "embed" // opaque URL; frontend iframes it directly
 	KindHLS   SourceKind = "hls"   // direct, CORS-open .m3u8 playlist; frontend plays it straight, no remux/iframe
-	KindFLV   SourceKind = "flv"   // vendor HTTP-FLV, proxied by us; frontend plays it with mpegts.js, no remux
+	KindFLV   SourceKind = "flv"   // vendor HTTP-FLV; frontend connects to the vendor's own URL directly with mpegts.js, no remux, no proxy
 )
 
 // LiveSource is what every vendor adapter must resolve a request into.
@@ -26,25 +26,27 @@ type LiveSource struct {
 	EmbedURL string // set when Kind == KindEmbed
 
 	// HLSURL is the direct playable URL handed to the frontend: the
-	// vendor's own .m3u8 for KindHLS, or our /api/flv/{key} proxy path for
+	// vendor's own .m3u8 for KindHLS, or the vendor's own signed FLV URL for
 	// KindFLV. Named for its first (and still most common) use rather than
 	// renamed across every caller when FLV was added.
 	HLSURL string // set when Kind == KindHLS or KindFLV
 
 	// Upstream, set when Kind == KindFLV, resolves a fresh vendor stream
-	// URL each time a viewer connects to the proxy. It must re-resolve
-	// rather than return a frozen URL for the same reason RemuxInput.Run
-	// re-negotiates per attempt: Chemito's login token / live-video URL is
-	// single-use or short-lived, so one cached URL is dead by the second
-	// viewer. Nothing about the vendor call leaves the server this way —
-	// the browser only ever sees our proxy path.
+	// URL. StreamService.StartStream calls it once per GET /api/stream/{id}
+	// request rather than caching the result, for the same reason
+	// RemuxInput.Run re-negotiates per attempt: Chemito's login token /
+	// live-video URL is single-use or short-lived, so a cached URL is dead
+	// by the next caller. A client that needs to reconnect just re-fetches
+	// /api/stream/{id} for a fresh one.
 	Upstream func(ctx context.Context) (string, error)
 
 	// HasAudio, for KindFLV, is whether audio was actually requested from
 	// the vendor. Chemito advertises audio in its FLV header even when
 	// asked for audio=0 and then sends no audio tags at all, which stalls
-	// any player that believes the header — so the proxy corrects the flag
-	// and needs to know the truth. See handleFLVProxy.
+	// any player that believes the header — so adapters now always request
+	// audio=1 upstream to avoid the lie in the first place (see
+	// vendors/chemitoapi.ResolveLiveSource). Kept here for adapters that
+	// still want to report the true state.
 	HasAudio bool
 
 	// RestartBackoff, if nonzero, overrides the service's default initial

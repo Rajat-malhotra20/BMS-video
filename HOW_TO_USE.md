@@ -9,9 +9,12 @@ those endpoints — never build one yourself.
 
 > **This deployment runs without a media server.** Every camera in use is
 > delivered straight from the vendor to the browser, so there is no
-> MediaMTX, no ffmpeg, and no RTSP relay. Endpoints that could only ever
-> describe a relayed stream are **not registered** and return `404`, not an
-> empty `200` — see [Endpoints that are not available](#endpoints-that-are-not-available).
+> MediaMTX, no ffmpeg, and no RTSP relay, and — as of this version — no
+> proxy for the FLV bytes either: `kind: "flv"` cameras hand back the
+> vendor's own stream URL directly, and the browser connects to the
+> vendor, not to this server. Endpoints that could only ever describe a
+> relayed stream are **not registered** and return `404`, not an empty
+> `200` — see [Endpoints that are not available](#endpoints-that-are-not-available).
 > `GET /` lists exactly what this server is serving right now; trust it over
 > this document if they ever disagree.
 
@@ -61,6 +64,11 @@ GET /api/fleet
   that bus having, independent of whether any are currently live — a
   free, no-cost signal (refreshed every ~30 min) for showing "this bus
   has N cameras" even before any of them are streaming.
+- **`kind: "flv"` buses are never counted in `cams` here.** They are not
+  tracked as "active sessions" any more (see endpoint 3), so they cannot
+  appear in the fleet snapshot the way an RTSP-ingested or embed/HLS bus
+  does. Don't use `/api/fleet` to decide whether an FLV camera is live —
+  call `/api/stream/{id}` and check the response instead.
 
 ### Real-time variant: `GET /api/fleet/stream`
 
@@ -92,23 +100,20 @@ GET /api/bus/DL1PC0001
   "id": "DL1PD8587",
   "cams": [
     { "cam": 1, "path": "DL1PD8587_1", "ready": true, "tracks": [],
-      "bytesReceived": 0, "readers": 0,
-      "kind": "flv", "directUrl": "/api/flv/DL1PD8587_1" },
-    { "cam": 2, "path": "DL1PD8587_2", "ready": true, "tracks": [],
-      "bytesReceived": 0, "readers": 0,
-      "kind": "flv", "directUrl": "/api/flv/DL1PD8587_2" }
+      "bytesReceived": 0, "readers": 0 }
   ]
 }
 ```
 
-Every camera carries a `kind` and a `directUrl` — see endpoint 3 for how to
-play each kind. Cams are sorted by `cam` number.
+Same caveat as `/api/fleet`: this reflects tracked sessions, and
+`kind: "flv"` cameras are never tracked as one, so an FLV bus with nobody
+currently mid-request against `/api/stream` will show an empty `cams`
+list here even though it's fully available. Use endpoint 3 to actually
+find out what's playable.
 
-**`tracks`, `bytesReceived` and `readers` are always empty/zero here**, and
+**`tracks`, `bytesReceived` and `readers` are always empty/zero**, and
 that is not a fault: those are byte counters from a media server relaying
-the stream, and nothing is relayed in this deployment. Don't use them to
-decide whether a camera is alive — use `ready`, and ultimately whether
-playback succeeds.
+the stream, and nothing is relayed in this deployment.
 
 ## 3. Get a playable video link for one camera
 
@@ -117,22 +122,23 @@ GET /api/stream/DL1PC0001          # every camera on the bus
 GET /api/stream/DL1PC0001?cam=1    # just one
 ```
 
-Without `?cam=N` you get **every** channel the vendor reports for that bus,
-starting any that aren't live yet — one call per bus is all a grid needs.
+Without `?cam=N` you get **every** channel the vendor reports for that bus.
 With `?cam=N` you get that one channel.
 
-Either way, cameras that aren't already live are started on demand, so the
-first call after a bus has been idle can take a few seconds; poll again if
-`ready` isn't `true` yet.
+**This is the endpoint that actually talks to the vendor**, and it does so
+on every single call for `kind: "flv"` cameras — there is no "already
+active, here's the cached link" shortcut for FLV any more. Each call asks
+the vendor for a fresh stream URL and hands it straight back. Practical
+consequences:
 
-`ready: true` means the session is registered, **not** that video is
-flowing — the recorder is only contacted when you fetch the stream. A bus
-reporting 9 cameras commonly has fewer wired: expect some tiles to 502 on
-playback and render them as unavailable rather than treating it as an
-error.
-
-Response shape depends on how that camera is delivered — check for a
-`kind` field to decide how to play it:
+- Only call this when you're actually about to hand the URL to a player
+  (on load, or to reconnect after an error). Don't poll it on a timer the
+  way you might poll `/api/fleet` — every poll is a real request against
+  the vendor device.
+- Every viewer who calls this for the same camera gets their **own**
+  vendor session/channel — there is no sharing any more. Ten people
+  watching one camera now costs the device ten channels, not one (see
+  "Things to know" below for the device's actual channel ceiling).
 
 ```json
 [
@@ -143,7 +149,7 @@ Response shape depends on how that camera is delivered — check for a
 ```json
 [
   { "cam": 1, "path": "DLPD8611_1", "ready": true,
-    "kind": "flv", "directUrl": "/api/flv/DLPD8611_1" }
+    "kind": "flv", "directUrl": "http://<vendor-host>:<port>/api/v1/live/video?...&key=..." }
 ]
 ```
 
@@ -151,10 +157,13 @@ Every camera has a `kind`. There is no fourth, un-`kind`ed case in this
 deployment: that shape (`whepUrl` + `hlsUrl`, a stream relayed through this
 server) only exists when a media server is running, which it is not.
 
-- **`kind: "flv"`** → live HTTP-FLV proxied by this server. Play
-  `directUrl` with [mpegts.js](https://github.com/xqq/mpegts.js) (see
-  below). All of a bus's cameras stream independently, so a 4-up grid is
-  4 separate players.
+- **`kind: "flv"`** → live HTTP-FLV, played **directly from the vendor** —
+  `directUrl` is the vendor's own absolute URL, not a path on this server.
+  Play it with [mpegts.js](https://github.com/xqq/mpegts.js) (see below).
+  This server is not in the data path for FLV at all any more: it only
+  brokers the login/URL resolution, then gets out of the way. All of a
+  bus's cameras stream independently, so a 4-up grid is 4 separate
+  players, each with its own vendor URL.
 - **`kind: "hls"`** → play `directUrl` straight in a `<video>` tag with
   hls.js — it's the vendor's own CDN URL, not proxied through this server.
 - **`kind: "embed"`** → `directUrl` is a page, not a media URL — load it
@@ -164,7 +173,7 @@ server) only exists when a media server is running, which it is not.
 
 ```js
 const player = mpegts.createPlayer(
-  { type: "flv", isLive: true, url: "http://<server-ip>:4000" + cam.directUrl },
+  { type: "flv", isLive: true, url: cam.directUrl },   // already an absolute vendor URL — do NOT prefix it with this server's address
   { liveBufferLatencyChasing: true },
 );
 player.attachMediaElement(videoEl);
@@ -172,31 +181,40 @@ player.load();
 player.play();
 ```
 
-Two things to get right:
+Three things to get right:
 
+- **`directUrl` is absolute already.** Earlier versions of this API served
+  FLV through a same-origin proxy path (`/api/flv/{key}`) and needed the
+  server address prepended. That proxy is gone — the URL you get back
+  already points at the vendor, so use it as-is.
 - **Don't open `directUrl` in a browser tab.** It serves `video/x-flv`,
   which no browser plays natively, so you'll get a file download instead
   of a picture. That's expected — the URL is for mpegts.js to fetch, not
   to navigate to.
-- **Back off when you reconnect.** These devices can't close a session, so
-  every reconnect leaves another one open on the recorder and a tight
-  retry loop will take the whole device offline. Wait a few seconds and
-  double it per failure; give up after a handful. The server enforces its
-  own 20-second-per-camera cooldown regardless (see below), so a fast
-  retry only earns a `503`.
+- **On reconnect, re-fetch `/api/stream`, don't resume the old URL.** The
+  vendor's link is single-use/short-lived, so a stale one won't work. Back
+  off between attempts too: these devices can't close a session on their
+  end, so a tight retry loop opens a new phantom session on every attempt
+  and can take the whole device offline. Wait a few seconds and roughly
+  double it per failure; give up after a handful of tries.
 
-There's a working reference implementation of a 4-up grid at
-[prototype/flv-demo.html](prototype/flv-demo.html) — open it in a browser
-and type a bus id.
+### Stopping a `kind: "flv"` camera
 
-### Errors from endpoint 3 and `/api/flv/{key}`
+`POST /api/bridge/stop?key={busId}_{cam}` exists, but for `kind: "flv"`
+it has nothing to stop server-side — FLV sessions aren't tracked as
+"active" here (see above), so this call will report `"stopped": false`
+for one even while it's genuinely playing in a browser. The only way to
+actually end an FLV stream is for the browser to stop requesting/playing
+it (destroy the player). `/api/bridge/stop` still works for real for
+`embed`/`hls` sessions and RTSP-ingested ones.
+
+### Errors from endpoint 3
 
 | Status | Means | What to do |
 |---|---|---|
-| `503` + `Retry-After` | That camera failed recently and is cooling down; the server didn't call the vendor at all | Wait for `Retry-After`, then retry |
-| `502` "device did not deliver video" | The recorder is offline, asleep, or out of concurrent sessions | Show the camera as unavailable; retry much later |
-| `502` "vendor closed the stream connection" | That channel number has no camera wired to it | Stop asking for this cam — it will never work |
-| `404` | The bus isn't known to any vendor account | Check the bus id |
+| `502` | The vendor call failed — device offline, no live ports, vendor rejected the request, etc. (see server logs for the specific vendor error) | Show the camera as unavailable; retry later, with backoff |
+| `404` (bare bus, no `?cam=`) | The bus isn't known to any vendor account | Check the bus id |
+| *(cam omitted from the array)* | For a bare `GET /api/stream/{id}` (no `?cam=`), a single bad channel is silently dropped rather than failing the whole request | Treat a missing cam number as unavailable, not an error |
 
 ## Endpoints that are not available
 
@@ -209,18 +227,21 @@ do not treat the `404` as an outage.
 |---|---|---|
 | `GET /api/stream/{id}/recording` | mp4 clips of a past window | needs the media server to have recorded it |
 | `GET /api/bridge` | listing active remux jobs | no remux jobs can exist |
+| `/api/flv/{key}` | this server proxying FLV bytes | removed — `kind: "flv"` now hands back the vendor's own URL directly instead |
 | `/live/...` | HLS playback of a relayed stream | proxy to a media server that is not running |
 | `/whep/...` | WebRTC playback of a relayed stream | same |
 | `/playback/...` | recording playback | same |
 
 Clips and evidence come from each vendor's own API instead.
 
-Any other unrecognised path also returns `404`. (It used to return `200`
-with the endpoint listing, so a typo looked like success — that is fixed.)
+Any other unrecognised path also returns `404`.
 
-These come back automatically if the raw-packet side is ever switched on
-(`INGEST_URL` set, MediaMTX + `media-mtxd` running). Nothing was deleted;
-the code for them lives in `media-MTX/`.
+The MediaMTX-backed routes come back automatically if the raw-packet side
+is ever switched on (`INGEST_URL` set, MediaMTX + `media-mtxd` running).
+Nothing was deleted there; that code lives in `media-MTX/`. The FLV proxy
+(`/api/flv/{key}`), however, was removed from the codebase entirely, not
+just disabled — see `git log` on `prototype/backend/flvhub.go` if you need
+the old byte-proxying behavior back.
 
 ## Cheat sheet
 
@@ -229,9 +250,9 @@ the code for them lives in `media-MTX/`.
 | See all buses | `GET /api/fleet` |
 | See all buses, live-updating (no polling) | `GET /api/fleet/stream` |
 | See one bus's cameras in detail | `GET /api/bus/{busId}` |
-| Watch one specific camera live (starts it if needed) | `GET /api/stream/{busId}?cam=2` |
-| Play what that returned | `kind: "flv"` → mpegts.js · `kind: "hls"` → hls.js · `kind: "embed"` → `<iframe>` |
-| Stop a camera | `POST /api/bridge/stop?key={busId}_{cam}` |
+| Watch one specific camera live (starts it if needed, re-resolves every call for FLV) | `GET /api/stream/{busId}?cam=2` |
+| Play what that returned | `kind: "flv"` → mpegts.js, `directUrl` used as-is · `kind: "hls"` → hls.js · `kind: "embed"` → `<iframe>` |
+| Stop a camera | `POST /api/bridge/stop?key={busId}_{cam}` — no-op for `kind: "flv"`, real for `embed`/`hls`/RTSP |
 | Check the server is alive | `GET /health` |
 | See which endpoints actually exist | `GET /` |
 | Watch a past moment | **not available** — no recording in this deployment |
@@ -243,36 +264,31 @@ the code for them lives in `media-MTX/`.
 - Streams auto-start once when the server boots (a redeploy/restart) so
   the fleet is usually already populated — after that, streaming is
   on-demand: nothing restarts a stream in the background if it stops.
-- For `kind: "flv"` buses, auto-start does **not** contact the recorder —
-  it only marks the cameras as known. So `/api/fleet` can list a camera
-  that turns out to be offline once you actually play it. Treat a `502`
-  from playback, not absence from the fleet list, as the real liveness
-  signal.
 - One vendor account allows **one active login at a time** (Chemito
-  enforces this — a new login invalidates the previous key). The server
-  logs in once and shares that session, so a full grid is fine, but two
-  backends on the same credentials (a local one and the deployed one) will
-  knock out each other's cameras as they open. A stream already playing is
-  unaffected; only ones being opened at that instant die.
-- Viewers are free. Every `kind: "flv"` camera has ONE upstream connection
-  to the recorder, shared by everyone watching it — ten people on a camera
-  costs the device exactly what one person costs (verified with 12
-  simultaneous viewers on one camera). What the device does ration is
-  *channels*: measured 6-7 concurrent channels on one bus before it starts
-  refusing, and 16 across the whole account.
-- An FLV response is never closed once it has started playing. If the
-  camera drops (a bus losing signal), the server reconnects underneath and
-  sends keep-alive tags meanwhile, so the tile recovers on its own. Do NOT
-  build a reconnect loop in the player for `kind: "flv"` — a closed
-  connection means the viewer went away, not the camera. A camera that has
-  never delivered video still fails fast with a `502`. Several people watching the
-  same bus at the same time can exhaust it. Don't hold players open on
-  cameras nobody is looking at — destroy the player when its tile is
-  hidden.
-- Nothing is relayed through this server except the FLV byte stream. There
-  is no transcoding and no recording, so a camera is either playable live
-  from its vendor right now or not at all.
+  enforces this — a new login invalidates the previous key and every
+  stream token minted from it). The server logs in once and reuses that
+  key indefinitely — it does **not** proactively re-login on a timer any
+  more, only when there's no cached key yet, or a vendor call actually
+  fails with an auth error. That means the app itself no longer causes
+  periodic drops. It still can't prevent an *external* login to the same
+  vendor account (e.g. someone using the vendor's own portal with the
+  same credentials) from invalidating the shared key — if that happens,
+  the next call this server makes will detect the auth failure and log in
+  again automatically, but whatever was open at that moment may drop.
+  Keep these credentials exclusive to this deployment if at all possible.
+- Viewers are **not free** for `kind: "flv"` any more. Every call to
+  `/api/stream/{id}?cam=N` opens a fresh vendor channel for that one
+  caller — there is no shared upstream connection fanned out to multiple
+  viewers the way there used to be. N viewers on one camera costs the
+  device N channels. The device's own channel ceiling still applies on
+  top of that: Chemito's live-video ports hold 4 channels each, the
+  account exposes 4 ports, so 16 concurrent channels is the practical
+  account-wide ceiling regardless of how many buses ask.
+- Nothing is relayed through this server for `kind: "flv"` any more — not
+  even the bytes. The browser talks to the vendor directly once it has the
+  URL; this server's only role is resolving that URL (and holding the
+  shared login key needed to do so).
 - `GET /` is the source of truth for which endpoints exist. It changes with
   the deployment, so a frontend can feature-detect instead of hardcoding.
-- This is a dev setup: no login/auth yet. Don't expose it to the public
-  internet as-is.
+- This is a dev setup: no login/auth yet beyond the shared `API_TOKEN`.
+  Don't expose it to the public internet as-is.

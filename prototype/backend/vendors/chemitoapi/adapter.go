@@ -10,7 +10,6 @@ import (
 	"errors"
 	"strconv"
 	"sync"
-	"time"
 
 	"mediamtx-console/domain"
 	rawclient "mediamtx-console/vendorclients/chemitoapi"
@@ -24,10 +23,9 @@ type Config struct {
 type Adapter struct {
 	cfg Config
 
-	// keyMu/key/keyAt hold the one shared login session. See session().
+	// keyMu/key hold the one shared login session. See session().
 	keyMu sync.Mutex
 	key   string
-	keyAt time.Time
 
 	// portMu/portByChannel pin each {terid}_{chl} to one of the account's
 	// live-video ports. See portFor.
@@ -81,13 +79,8 @@ func (a *Adapter) portFor(ports []rawclient.VideoPort, channelKey string) int {
 
 func (a *Adapter) Name() string { return "chemitoapi" }
 
-// keyTTL is how long a verify key is reused before logging in again. The
-// doc gives no expiry, so this is a conservative refresh; an actually-
-// expired key is also caught by the retry in resolveURL.
-const keyTTL = 10 * time.Minute
-
 // session returns a client carrying the account's shared verify key,
-// logging in only when there isn't a usable one.
+// logging in only when there isn't a cached one yet.
 //
 // One key for the whole process, not one per call, because the server
 // keeps a single active session per account: a second Login invalidates
@@ -98,6 +91,16 @@ const keyTTL = 10 * time.Minute
 // Confirmed live 2026-08-26: 6 concurrent channels went 1/6 with per-call
 // logins, 6/6 sharing a key.
 //
+// No proactive TTL-based refresh either, for the same reason: the doc
+// gives no expiry, and a Login() call is never harmless here — it kills
+// every camera streaming on the previous key. A time-based refresh was
+// tried and rejected: it re-logged-in every 10 minutes regardless of
+// active viewers, which reads to the vendor as someone else logging in
+// and silently drops every open stream on that schedule. An actually-
+// expired or externally-invalidated key is instead caught by the
+// isAuthError retry in resolveURL, which only re-logs-in once a real call
+// has actually failed.
+//
 // The lock is held across the login on purpose: concurrent first-connects
 // must queue behind one login rather than each start their own.
 func (a *Adapter) session() (*rawclient.Client, error) {
@@ -105,7 +108,7 @@ func (a *Adapter) session() (*rawclient.Client, error) {
 	defer a.keyMu.Unlock()
 
 	c := rawclient.NewClient(a.cfg.BaseURL, nil)
-	if a.key != "" && time.Since(a.keyAt) < keyTTL {
+	if a.key != "" {
 		c.UseKey(a.key)
 		return c, nil
 	}
@@ -113,7 +116,7 @@ func (a *Adapter) session() (*rawclient.Client, error) {
 	if err != nil {
 		return nil, domain.WrapVendorErr("chemitoapi", "login", err)
 	}
-	a.key, a.keyAt = key, time.Now()
+	a.key = key
 	return c, nil
 }
 
@@ -173,11 +176,11 @@ func (a *Adapter) resolveURL(terid string, channel int, audio bool, st rawclient
 }
 
 // ResolveLiveSource returns KindFLV: the vendor's HTTP-FLV live stream,
-// played directly in the browser by mpegts.js behind our /api/flv/{key}
-// proxy — no ffmpeg, no MediaMTX. Upstream logs in, resolves an available
-// relay port (§4 of the doc's operation steps — "Get video port
-// information" then "Get device list"), and requests the FLV URL fresh on
-// every viewer connect.
+// played directly in the browser by mpegts.js against the vendor's own
+// signed URL — no ffmpeg, no MediaMTX, no proxy. Upstream logs in, resolves
+// an available relay port (§4 of the doc's operation steps — "Get video
+// port information" then "Get device list"), and requests the FLV URL
+// fresh on every call, since the vendor's token is single-use.
 //
 // This used to be KindRTSP (ffmpeg remux into MediaMTX). Dropped because
 // MediaMTX's RTSP muxer rejects Chemito's non-monotonic DTS (it reports 0
@@ -208,11 +211,17 @@ func (a *Adapter) ResolveLiveSource(ctx context.Context, req domain.StreamReques
 		st = rawclient.LiveStreamMain
 	}
 
+	// Always request audio=1 from the vendor, regardless of req.Audio:
+	// Chemito's FLV header claims audio even when asked for audio=0 and
+	// then sends no audio tags at all, which stalls a player that trusts
+	// the header. That mismatch only exists in the audio=0 case, so
+	// asking for audio unconditionally sidesteps it — no header to lie
+	// about — at the cost of decoding an audio track callers may not want.
 	upstream := func(ctx context.Context) (string, error) {
-		return a.resolveURL(terid, channel, req.Audio, st)
+		return a.resolveURL(terid, channel, true, st)
 	}
 
-	return domain.LiveSource{Kind: domain.KindFLV, Upstream: upstream, HasAudio: req.Audio}, nil
+	return domain.LiveSource{Kind: domain.KindFLV, Upstream: upstream, HasAudio: true}, nil
 }
 
 // ListCameras returns every device registered on this account, via the

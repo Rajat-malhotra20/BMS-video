@@ -50,15 +50,18 @@ type apiServer struct {
 	channelCounts func(ctx context.Context) map[string]int
 
 	// unwired, if set, reports a {bus}_{cam} the device has already proven
-	// has no camera on it (see flvHub.Unwired). The vendor's channel count
-	// is a slot count, not a camera count, and offering the empty slots
-	// costs real sessions on a device that has few.
+	// has no camera on it. The vendor's channel count is a slot count, not
+	// a camera count, and offering the empty slots costs real sessions on
+	// a device that has few. Always nil now: this used to be answered by
+	// the FLV proxy's byte-level view of each channel, which no longer
+	// exists — KindFLV hands the browser the vendor's own URL directly.
+	// unwiredCams treats nil as "unknown", not "none unwired".
 	unwired func(key string) bool
 
 	// flvLive, if set, reports whether an FLV key has an upstream that has
-	// actually produced video, and whether the hub knows the key at all
-	// (see flvHub.Live). The direct-entry registry cannot answer this: it
-	// records what was started, not what is streaming.
+	// actually produced video, and whether it's known at all. Always nil
+	// now, for the same reason unwired is: no proxy left to observe bytes
+	// flowing. directPaths treats nil as "assume ready".
 	flvLive func(key string) (live, known bool)
 
 	cacheMu     sync.Mutex
@@ -95,12 +98,12 @@ func newAPIServer(ingestBase string) *apiServer {
 //
 // Ready is the part that needs care. A direct entry is registered when a
 // stream is started and dropped only by an explicit stop, so its presence
-// means "someone started this once", not "video is flowing". For FLV the
-// hub holds the upstream and therefore knows the difference — so ask it,
-// and a channel it has never got a frame from (an unwired channel number, a
-// device that stopped answering) stops being counted as a live camera.
-// Without this GET /api/fleet reported cams 8 and 9 of DLPD8611 as online
-// with nothing behind them, and disagreed with GET /api/hub.
+// means "someone started this once", not "video is flowing". flvLive used
+// to distinguish the two for FLV by asking the proxy that held the
+// upstream; there is no such proxy any more (KindFLV isn't cached as
+// active at all — see StreamService.StartStream), so no FLV entry ever
+// reaches this loop and the flvLive branch below is effectively dead,
+// kept only for a nil-safe default if something wires it again.
 func (a *apiServer) directPaths() []ingestPath {
 	if a.directKeys == nil {
 		return nil

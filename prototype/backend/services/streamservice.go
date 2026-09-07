@@ -211,20 +211,20 @@ func (s *StreamService) StartStream(ctx context.Context, req domain.StreamReques
 
 	switch src.Kind {
 	case domain.KindFLV:
-		// No ffmpeg, no MediaMTX: the browser plays the vendor's FLV
-		// through our proxy, which calls src.Upstream fresh per connect.
-		// Cached as active for the same reason KindHLS is — later
-		// GET /api/stream/{id}?cam=N calls resolve from here instead of
-		// re-running the vendor's start-streaming side effect, and it's
-		// what /api/flv/{key} looks the Upstream func up in.
-		flvURL := "/api/flv/" + key
-		s.directMu.Lock()
-		if s.directActive == nil {
-			s.directActive = make(map[string]DirectEntry)
+		// No ffmpeg, no MediaMTX, no proxy: the browser connects straight
+		// to the vendor's FLV URL. src.Upstream is resolved here, once per
+		// StartStream call, rather than left for a proxy to call fresh per
+		// viewer — every GET /api/stream/{id} already re-invokes this, which
+		// is the same "fresh per connect" guarantee the vendor's single-use
+		// token needs; a caller just needs to re-fetch /api/stream to
+		// reconnect. Not cached as active for the same reason KindEmbed
+		// isn't: a cached URL would go stale (single-use token) before the
+		// next viewer could use it, so every call must re-resolve.
+		url, err := src.Upstream(ctx)
+		if err != nil {
+			return domain.StreamResult{}, err
 		}
-		s.directActive[key] = DirectEntry{Key: key, Kind: src.Kind, HLSURL: flvURL, Upstream: src.Upstream, HasAudio: src.HasAudio}
-		s.directMu.Unlock()
-		return domain.StreamResult{Key: key, Kind: src.Kind, HLSURL: flvURL}, nil
+		return domain.StreamResult{Key: key, Kind: src.Kind, HLSURL: url}, nil
 
 	case domain.KindHLS:
 		// Only a confirmed real stream is worth caching as "active" — an
@@ -373,15 +373,6 @@ type DirectEntry struct {
 	Kind     domain.SourceKind
 	EmbedURL string
 	HLSURL   string
-	// Upstream is set only for KindFLV: what /api/flv/{key} calls to get a
-	// fresh vendor stream URL for each viewer that connects. Never
-	// serialized — the browser only ever sees HLSURL (our proxy path), so
-	// the vendor's single-use token stays server-side.
-	Upstream func(ctx context.Context) (string, error)
-	// HasAudio mirrors domain.LiveSource.HasAudio — whether audio was
-	// actually requested, so the proxy knows if the vendor's FLV header is
-	// lying about having an audio track.
-	HasAudio bool
 }
 
 // ActiveDirectKeys returns the keys currently live via a non-RTSP vendor
@@ -397,46 +388,6 @@ func (s *StreamService) ActiveDirectKeys() []DirectEntry {
 	return entries
 }
 
-// UpstreamFor resolves one FLV channel at the exact quality req asks for,
-// WITHOUT touching the active-session registry.
-//
-// The registry holds one entry per camera, and that entry's resolver has a
-// quality baked into it (whatever the first caller asked for). That is fine
-// as the camera's default, but a grid watching the device's sub-stream while
-// someone else watches the main stream needs two resolvers for one camera —
-// so this hands back a resolver directly and leaves the registry alone. The
-// caller (handleFLVProxy) still ensures the registry entry exists, because
-// that is what makes the camera visible in GET /api/fleet.
-//
-// Returns a VendorError for anything but an FLV source: no other kind has a
-// per-connect resolver to hand out.
-func (s *StreamService) UpstreamFor(ctx context.Context, req domain.StreamRequest) (domain.LiveSource, error) {
-	adapter, err := s.Registry.Get(req.Vendor)
-	if err != nil {
-		return domain.LiveSource{}, err
-	}
-	src, err := adapter.ResolveLiveSource(ctx, req)
-	if err != nil {
-		return domain.LiveSource{}, err
-	}
-	if src.Kind != domain.KindFLV || src.Upstream == nil {
-		return domain.LiveSource{}, &domain.VendorError{
-			Vendor: req.Vendor, Op: "resolve live source", Code: "not_flv",
-		}
-	}
-	return src, nil
-}
-
-// DirectEntryFor returns the tracked direct session under key, if any —
-// how the /api/flv/{key} proxy reaches that session's Upstream resolver
-// without re-running StartStream (which would re-trigger the vendor's
-// start-streaming call on every viewer connect, not just the first).
-func (s *StreamService) DirectEntryFor(key string) (DirectEntry, bool) {
-	s.directMu.Lock()
-	defer s.directMu.Unlock()
-	e, ok := s.directActive[key]
-	return e, ok
-}
 
 func (s *StreamService) ListCameras(ctx context.Context, vendor string, vendorParams map[string]string) ([]domain.Camera, error) {
 	adapter, err := s.Registry.Get(vendor)
