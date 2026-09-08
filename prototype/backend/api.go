@@ -720,7 +720,19 @@ func (a *apiServer) handleStreamRecording(w http.ResponseWriter, r *http.Request
 func writeJSON(w http.ResponseWriter, v any) {
 	w.Header().Set("Content-Type", "application/json")
 	w.Header().Set("Cache-Control", "no-store")
-	if err := json.NewEncoder(w).Encode(v); err != nil {
+	enc := json.NewEncoder(w)
+	// Go's encoder HTML-escapes &, <, > (to & etc.) by default, a
+	// safeguard for JSON embedded inline in an HTML <script> tag. This API
+	// is fetched as application/json, never embedded that way, and every
+	// directUrl is a real URL containing literal "&" query separators — the
+	// default just makes the raw response harder to read/copy-paste
+	// (confirmed live: pasting an un-decoded &-escaped directUrl straight
+	// into a browser address bar sends "&" as literal characters instead
+	// of a query separator, mangling every param after the first). A real
+	// JSON.parse()/response.json() call decodes either form identically, so
+	// this only affects manual inspection, not correctness for real callers.
+	enc.SetEscapeHTML(false)
+	if err := enc.Encode(v); err != nil {
 		log.Printf("writeJSON: %v", err)
 	}
 }

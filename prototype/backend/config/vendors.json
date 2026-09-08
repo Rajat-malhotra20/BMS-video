@@ -6,7 +6,7 @@
     "extra": { "projectId": "37" }
   },
   "chemitoapi": {
-    "baseUrl": "https://15.252.130.159:22056",
+    "baseUrl": "https://itms-gateway.gna.energy:22056",
     "username": "media-live",
     "password": "PMIDTC@$1234"
   }

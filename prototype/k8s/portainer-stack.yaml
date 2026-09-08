@@ -85,7 +85,7 @@ data:
     {
       "castmaster": { "baseUrl": "https://cmmipl.org:22056", "username": "admin", "password": "" },
       "sumithlive": { "baseUrl": "https://trakzee2.uffizio.com", "username": "vishvam@Login.com", "password": "", "extra": { "projectId": "37" } },
-      "chemitoapi": { "baseUrl": "https://15.252.130.159:22056", "username": "media-live", "password": "" }
+      "chemitoapi": { "baseUrl": "https://itms-gateway.gna.energy:22056", "username": "media-live", "password": "" }
     }
   buses.json: |
     {
