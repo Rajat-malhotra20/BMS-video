@@ -5,12 +5,15 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
+	"io"
 	"net/http"
 	"strconv"
+	"time"
 
 	vendorconfig "mediamtx-console/config"
 	"mediamtx-console/domain"
 	"mediamtx-console/services"
+	"mediamtx-console/vendors"
 )
 
 // unifiedBridgeServer exposes the vendor-less bridge API: the frontend
@@ -22,10 +25,31 @@ import (
 type unifiedBridgeServer struct {
 	stream *services.StreamService
 	buses  map[string]vendorconfig.Bus
+
+	// hub holds one upstream vendor connection per {bus}_{cam}, shared by
+	// every viewer of that camera. See flvhub.go. This is what lets a
+	// browser hold a single stable /api/flv/{key} URL indefinitely instead
+	// of re-fetching /api/stream on a timer: the hub reconnects to the
+	// vendor underneath, invisibly, and the browser's connection to this
+	// server never has to change.
+	hub *flvHub
 }
 
 func newUnifiedBridgeServer(stream *services.StreamService, buses map[string]vendorconfig.Bus) *unifiedBridgeServer {
-	return &unifiedBridgeServer{stream: stream, buses: buses}
+	hub := newFLVHub()
+	// A capacity slot (see chemitoapi.Adapter.acquireSlot) is reserved the
+	// first time a channel's resolver runs and must be freed exactly when
+	// the device session it represents genuinely ends — which only the hub
+	// knows, since it owns the real connection (see StreamService.StopStream
+	// for why that call can't be trusted to know this).
+	hub.onChannelClosed = func(key string) {
+		for _, a := range stream.Registry.All() {
+			if releaser, ok := a.(vendors.Releaser); ok {
+				releaser.Release(key)
+			}
+		}
+	}
+	return &unifiedBridgeServer{stream: stream, buses: buses, hub: hub}
 }
 
 type bridgeStartRequest struct {
@@ -134,6 +158,11 @@ func (u *unifiedBridgeServer) handleStop(w http.ResponseWriter, r *http.Request)
 	writeJSON(w, map[string]any{"key": key, "stopped": stopped})
 }
 
+// handleHub reports what every FLV channel is doing right now.
+func (u *unifiedBridgeServer) handleHub(w http.ResponseWriter, _ *http.Request) {
+	writeJSON(w, u.hub.stats())
+}
+
 func (u *unifiedBridgeServer) handleList(w http.ResponseWriter, r *http.Request) {
 	writeJSON(w, u.stream.ListActive(r.Context()))
 }
@@ -154,6 +183,17 @@ func writeBridgeError(w http.ResponseWriter, err error) {
 			http.Error(w, err.Error(), http.StatusNotImplemented)
 		case vendorErr.Code == "device_offline":
 			http.Error(w, err.Error(), http.StatusNotFound)
+		case vendorErr.Code == "capacity_limit":
+			// Distinct from a vendor/network failure (502): the account's
+			// own channel ceiling is intentionally kept below the vendor's
+			// real limit (see chemitoapi.maxActiveChannels), so this means
+			// "try again once another camera's viewers go idle," not
+			// "something is broken." A slot frees on its own once a
+			// channel's last viewer leaves and the hub's idleGrace lapses
+			// (see flvHub.onChannelClosed) — there is no manual "stop
+			// another stream" action that speeds this up, since
+			// POST /api/bridge/stop is a no-op for kind: flv server-side.
+			http.Error(w, err.Error(), http.StatusServiceUnavailable)
 		default:
 			http.Error(w, err.Error(), http.StatusBadGateway)
 		}
@@ -161,4 +201,140 @@ func writeBridgeError(w http.ResponseWriter, err error) {
 	}
 
 	http.Error(w, err.Error(), http.StatusBadGateway)
+}
+
+// flvStallTimeout is how long the proxy waits for any byte from the vendor
+// before giving up on a connection. Mirrors what the old ffmpeg path needed
+// -rw_timeout for: a Chemito TCP connection that stops delivering frames
+// but never closes leaves the reader blocked forever, so the viewer sees a
+// frozen picture and no error. Generous against a live feed's real frame
+// gaps (~30KB/s continuous, confirmed live 2026-08-20).
+const flvStallTimeout = 15 * time.Second
+
+// flvClient has no overall timeout on purpose — an http.Client.Timeout
+// covers the whole request including reading the body, which for a live
+// stream means cutting off a perfectly healthy feed at the deadline.
+// stallReader below is what bounds a dead connection instead.
+var flvClient = &http.Client{}
+
+// handleFLVProxy streams one Chemito channel's HTTP-FLV through to the
+// browser, where mpegts.js plays it directly. This exists for two reasons
+// the browser can't work around itself: the vendor's relay port sends no
+// CORS headers, so a direct fetch from the page is blocked; and its stream
+// URL carries a single-use/short-lived token that must be re-resolved per
+// connection and must not be handed out to clients.
+//
+// One upstream vendor connection per {bus}_{cam}, shared by every viewer —
+// see flvhub.go for why per-viewer upstreams were tried and abandoned.
+func (u *unifiedBridgeServer) handleFLVProxy(w http.ResponseWriter, r *http.Request) {
+	key := r.PathValue("key")
+	bus, cam, ok := parseBusPath(key)
+	if !ok {
+		http.Error(w, "invalid stream key "+key, http.StatusBadRequest)
+		return
+	}
+
+	entry, ok := u.stream.DirectEntryFor(key)
+	if !ok {
+		// Nobody has started this channel yet (fresh process, or the
+		// browser hit the proxy URL straight from a bookmark) — start it
+		// the same way GET /api/stream/{id}?cam=N would, then retry.
+		if _, configured, err := u.startBus(r.Context(), bus, cam, true, true); err != nil {
+			writeBridgeError(w, err)
+			return
+		} else if !configured {
+			http.Error(w, fmt.Sprintf("bus %q is not configured for bridging", bus), http.StatusNotFound)
+			return
+		}
+		if entry, ok = u.stream.DirectEntryFor(key); !ok {
+			http.Error(w, "stream "+key+" is not an FLV source", http.StatusConflict)
+			return
+		}
+	}
+	if entry.Upstream == nil {
+		http.Error(w, "stream "+key+" is not an FLV source", http.StatusConflict)
+		return
+	}
+
+	// Quality is the caller's choice, because a grid and a fullscreen view
+	// want opposite things. ?sub=1 asks the device for its sub-stream and
+	// ?audio=0 drops the audio track:
+	//
+	//   grid tile   ?sub=1&audio=0   small, fast to start, cheap to decode
+	//   fullscreen  (no params)      main stream with audio, as before
+	//
+	// Defaults are the old behaviour exactly, so existing URLs are unchanged.
+	upstream, hasAudio, variant := entry.Upstream, entry.HasAudio, ""
+	sub := r.URL.Query().Get("sub") == "1"
+	audio := r.URL.Query().Get("audio") != "0"
+	if sub || !audio {
+		variant = flvVariant(sub, audio)
+		vendor, vendorParams, found := u.vendorFor(r.Context(), bus)
+		if !found {
+			http.Error(w, fmt.Sprintf("bus %q is not configured for bridging", bus), http.StatusNotFound)
+			return
+		}
+		// Resolved per request rather than taken from the registry: the
+		// registry's resolver carries whatever quality was asked for first,
+		// and this viewer wants a different one. Cheap for Chemito — the
+		// resolver is a closure, the vendor is not called until the hub
+		// connects (vendors/chemitoapi.Adapter.ResolveLiveSource).
+		src, err := u.stream.UpstreamFor(r.Context(), domain.StreamRequest{
+			Bus: bus, Cam: cam, Vendor: vendor, Main: !sub, Audio: audio, VendorParams: vendorParams,
+		})
+		if err != nil {
+			writeBridgeError(w, err)
+			return
+		}
+		upstream, hasAudio = src.Upstream, src.HasAudio
+	}
+
+	// Everything past here — connecting, reconnecting, holding the viewer
+	// open across a vendor outage — belongs to the hub, which shares one
+	// device session across every viewer of this camera at this quality.
+	u.hub.serveVariant(w, r, key, variant, upstream, hasAudio)
+}
+
+// flvVariant names a quality for the hub's channel map and for GET /api/hub.
+// "" is main stream with audio, so the default costs no extra channel.
+func flvVariant(sub, audio bool) string {
+	switch {
+	case sub && !audio:
+		return "sub,noaudio"
+	case sub:
+		return "sub"
+	case !audio:
+		return "noaudio"
+	default:
+		return ""
+	}
+}
+
+// stallReader fails a Read that produces nothing for timeout, so a vendor
+// connection that goes quiet without closing doesn't hang the viewer
+// forever. It closes the underlying body to unblock the in-flight Read.
+type stallReader struct {
+	r       io.Reader
+	timeout time.Duration
+	closer  io.Closer
+}
+
+func (s *stallReader) Read(p []byte) (int, error) {
+	timer := time.AfterFunc(s.timeout, func() { s.closer.Close() })
+	defer timer.Stop()
+	return s.r.Read(p)
+}
+
+// flushWriter flushes after every chunk so live frames aren't buffered.
+type flushWriter struct {
+	w io.Writer
+	f http.Flusher
+}
+
+func (fw flushWriter) Write(p []byte) (int, error) {
+	n, err := fw.w.Write(p)
+	if fw.f != nil {
+		fw.f.Flush()
+	}
+	return n, err
 }

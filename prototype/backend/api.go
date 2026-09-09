@@ -527,7 +527,11 @@ func (a *apiServer) handleStreamLive(w http.ResponseWriter, r *http.Request) {
 			if len(result) == 0 && a.ensureStream != nil {
 				started, err := a.ensureStream(r.Context(), id, wantCam)
 				if err != nil {
-					http.Error(w, err.Error(), http.StatusBadGateway)
+					// writeBridgeError, not a flat 502: a capacity_limit
+					// error here means "the account's channel cap is full,"
+					// not "the vendor is unreachable" — the frontend needs
+					// to tell those apart to retry sensibly.
+					writeBridgeError(w, err)
 					return
 				}
 				if started != nil {

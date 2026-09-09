@@ -17,6 +17,15 @@ type Adapter interface {
 	ListCameras(ctx context.Context, vendorParams map[string]string) ([]domain.Camera, error)
 }
 
+// Releaser is implemented by adapters that gate concurrent sessions against
+// a vendor-side ceiling (e.g. Chemito's per-account channel limit) and need
+// to know when a {bus}_{cam} key is no longer wanted, so the slot it held
+// can be freed immediately instead of waiting for its TTL to lapse.
+// Adapters that don't track capacity simply don't implement this.
+type Releaser interface {
+	Release(channelKey string)
+}
+
 type Registry struct {
 	adapters map[string]Adapter
 }

@@ -10,6 +10,7 @@ import (
 	"errors"
 	"strconv"
 	"sync"
+	"time"
 
 	"mediamtx-console/domain"
 	rawclient "mediamtx-console/vendorclients/chemitoapi"
@@ -19,6 +20,26 @@ import (
 type Config struct {
 	BaseURL, Username, Password string
 }
+
+// maxActiveChannels caps how many channels this adapter will keep live at
+// once, below the account's real 16-channel ceiling (4 ports x 4 channels,
+// see portFor). The 4-channel gap is deliberate slack, not waste: it covers
+// the brief overlap between an old connection closing and its replacement
+// opening on refresh/reconnect, plus any manual dashboard/curl use against
+// the same account — headroom that doesn't exist at 16/16, where a single
+// overlapping connection 408s an unrelated channel (see portFor's doc).
+const maxActiveChannels = 12
+
+// activeSlotTTL is a crash-safety backstop, not the normal release path.
+// The FLV hub (flvhub.go) holds one real device connection open per
+// channel for as long as it has viewers — often far longer than any short
+// timeout — and calls Release the moment it actually tears that connection
+// down (flvHub.onChannelClosed), which is the deterministic way a slot is
+// meant to be freed. This TTL only matters if that callback is ever missed
+// (a panic mid-teardown, a process restart that drops the hub's state but
+// not this adapter's), so it's set long enough to never fire during a
+// legitimately long-lived, healthy stream.
+const activeSlotTTL = 30 * time.Minute
 
 type Adapter struct {
 	cfg Config
@@ -31,10 +52,58 @@ type Adapter struct {
 	// live-video ports. See portFor.
 	portMu        sync.Mutex
 	portByChannel map[string]int
+
+	// activeMu/active track which channel keys currently hold one of the
+	// maxActiveChannels slots, and when that slot was last renewed. See
+	// acquireSlot and Release.
+	activeMu sync.Mutex
+	active   map[string]time.Time
 }
 
 func New(cfg Config) *Adapter {
-	return &Adapter{cfg: cfg, portByChannel: make(map[string]int)}
+	return &Adapter{cfg: cfg, portByChannel: make(map[string]int), active: make(map[string]time.Time)}
+}
+
+// acquireSlot reserves capacity for channelKey, evicting any slots whose
+// TTL has lapsed first. A channel already holding a slot just gets its
+// timestamp renewed — a reconnect of an already-counted channel must never
+// be turned away for being "over capacity" against its own past self.
+func (a *Adapter) acquireSlot(channelKey string) error {
+	a.activeMu.Lock()
+	defer a.activeMu.Unlock()
+
+	now := time.Now()
+	for k, last := range a.active {
+		if now.Sub(last) > activeSlotTTL {
+			delete(a.active, k)
+		}
+	}
+
+	if _, ok := a.active[channelKey]; ok {
+		a.active[channelKey] = now
+		return nil
+	}
+
+	if len(a.active) >= maxActiveChannels {
+		return &domain.VendorError{
+			Vendor: "chemitoapi", Op: "resolve live video url", Code: "capacity_limit",
+			Retryable: true,
+		}
+	}
+
+	a.active[channelKey] = now
+	return nil
+}
+
+// Release frees channelKey's capacity slot immediately, for callers that
+// know a channel has actually stopped — in practice, only the FLV hub's
+// onChannelClosed callback, once every viewer of that camera is gone and
+// its idle grace has lapsed — rather than waiting for activeSlotTTL to
+// reclaim it. Safe to call for a key that never held a slot.
+func (a *Adapter) Release(channelKey string) {
+	a.activeMu.Lock()
+	delete(a.active, channelKey)
+	a.activeMu.Unlock()
 }
 
 // portFor picks which of the account's live-video ports a channel streams
@@ -176,11 +245,14 @@ func (a *Adapter) resolveURL(terid string, channel int, audio bool, st rawclient
 }
 
 // ResolveLiveSource returns KindFLV: the vendor's HTTP-FLV live stream,
-// played directly in the browser by mpegts.js against the vendor's own
-// signed URL — no ffmpeg, no MediaMTX, no proxy. Upstream logs in, resolves
-// an available relay port (§4 of the doc's operation steps — "Get video
-// port information" then "Get device list"), and requests the FLV URL
-// fresh on every call, since the vendor's token is single-use.
+// played in the browser by mpegts.js against our own /api/flv/{key} proxy
+// (see flvhub.go) — no ffmpeg, no MediaMTX. Upstream logs in, resolves an
+// available relay port (§4 of the doc's operation steps — "Get video port
+// information" then "Get device list"), and requests the FLV URL fresh
+// each time the hub opens a real connection, since the vendor's token is
+// single-use. The browser never sees that URL or has to know about its
+// lifetime: it holds one stable proxy URL, and the hub re-resolves and
+// reconnects underneath it.
 //
 // This used to be KindRTSP (ffmpeg remux into MediaMTX). Dropped because
 // MediaMTX's RTSP muxer rejects Chemito's non-monotonic DTS (it reports 0
@@ -191,9 +263,11 @@ func (a *Adapter) resolveURL(terid string, channel int, audio bool, st rawclient
 // stops mattering. Bypassing the remux also means channels no longer
 // compete for ffmpeg processes or share a publisher's fate.
 //
-// Upstream must re-resolve per connect, not freeze one URL: confirmed live
-// 2026-08-19 that Chemito's login token / live-video URL is single-use or
-// short-lived, so a cached URL is already dead for the next viewer.
+// Upstream must re-resolve per connection, not freeze one URL: confirmed
+// live 2026-08-19 that Chemito's login token / live-video URL is single-use
+// or short-lived, so a cached URL is already dead for the next connection
+// attempt. The hub is the only thing that calls this — once when it first
+// opens a channel, again on each reconnect — never once per viewer.
 //
 // The device's own "transmitport" field (from ListDevices) is NOT a
 // connectable stream port — confirmed live 2026-08-19: connecting to it
@@ -217,7 +291,15 @@ func (a *Adapter) ResolveLiveSource(ctx context.Context, req domain.StreamReques
 	// the header. That mismatch only exists in the audio=0 case, so
 	// asking for audio unconditionally sidesteps it — no header to lie
 	// about — at the cost of decoding an audio track callers may not want.
+	channelKey := terid + "_" + strconv.Itoa(channel)
 	upstream := func(ctx context.Context) (string, error) {
+		// Gate before ever calling the vendor: acquireSlot renews an
+		// already-held slot on every reconnect, and only rejects a channel
+		// that would push the account past maxActiveChannels. See its doc
+		// for why this stops short of the account's real 16-channel limit.
+		if err := a.acquireSlot(channelKey); err != nil {
+			return "", err
+		}
 		return a.resolveURL(terid, channel, true, st)
 	}
 
