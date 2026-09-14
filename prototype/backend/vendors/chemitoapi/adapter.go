@@ -8,6 +8,7 @@ package chemitoapi
 import (
 	"context"
 	"errors"
+	"log"
 	"strconv"
 	"sync"
 	"time"
@@ -22,13 +23,25 @@ type Config struct {
 }
 
 // maxActiveChannels caps how many channels this adapter will keep live at
-// once, below the account's real 16-channel ceiling (4 ports x 4 channels,
-// see portFor). The 4-channel gap is deliberate slack, not waste: it covers
-// the brief overlap between an old connection closing and its replacement
-// opening on refresh/reconnect, plus any manual dashboard/curl use against
-// the same account — headroom that doesn't exist at 16/16, where a single
-// overlapping connection 408s an unrelated channel (see portFor's doc).
-const maxActiveChannels = 12
+// once, at the account's real 16-channel ceiling (4 ports x 4 channels, see
+// portFor) — no reserved slack below it.
+//
+// This used to sit at 12, four channels below 16, specifically to absorb
+// the overlap between an old connection closing and its replacement opening
+// on a bus switch. That overlap is now short-lived instead of avoided:
+// switching buses calls flvHub.ExpediteBus, which drops the old bus's
+// viewerless channels immediately in the background instead of waiting out
+// idleGrace (see its doc), so the two bus's channels only briefly coexist
+// rather than one sitting idle for up to a minute. Running the ceiling at
+// the real 16 lets a fresh bus fill every remaining slot right away instead
+// of getting throttled by our own conservative buffer.
+//
+// The risk this trades away: portFor's doc notes a single overlapping
+// connection at 16/16 can 408 an unrelated channel on the same port. If
+// that starts showing up in practice, or if the account's real entitlement
+// turns out to be lower than 16 (see the diagnostic log in resolveURL),
+// this is the number to pull back down.
+const maxActiveChannels = 16
 
 // activeSlotTTL is a crash-safety backstop, not the normal release path.
 // The FLV hub (flvhub.go) holds one real device connection open per
@@ -104,6 +117,14 @@ func (a *Adapter) Release(channelKey string) {
 	a.activeMu.Lock()
 	delete(a.active, channelKey)
 	a.activeMu.Unlock()
+}
+
+// activeCount reports how many channel slots this process currently
+// believes are held, for diagnostic logging only (see resolveURL).
+func (a *Adapter) activeCount() int {
+	a.activeMu.Lock()
+	defer a.activeMu.Unlock()
+	return len(a.active)
 }
 
 // portFor picks which of the account's live-video ports a channel streams
@@ -229,6 +250,16 @@ func (a *Adapter) resolveURL(terid string, channel int, audio bool, st rawclient
 				Vendor: "chemitoapi", Op: "resolve live source", Code: "no_live_ports", Retryable: true,
 			}
 		}
+		// Diagnostic only: this account's port count is the real entitlement
+		// ceiling (see maxActiveChannels' doc), distinct from our own software
+		// throttle. Logged on every resolve so a support ticket to the vendor
+		// can cite exactly what this account was offered when a channel that
+		// works under a different account gets an immediate EOF here — that
+		// EOF gets misread as "no camera wired" (see errUnwired in flvhub.go)
+		// when it may really be this account's concurrency cap, not the
+		// device's wiring.
+		log.Printf("chemitoapi: %s_%d: account offers %d live port(s); %d channel(s) currently held by this process",
+			terid, channel, len(ports), a.activeCount())
 		url, err := client.LiveVideoURL(terid, channel, audio, st, a.portFor(ports, terid+"_"+strconv.Itoa(channel)))
 		if err != nil {
 			return "", domain.WrapVendorErr("chemitoapi", "resolve live video url", err)

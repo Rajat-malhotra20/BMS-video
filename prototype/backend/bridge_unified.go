@@ -158,6 +158,21 @@ func (u *unifiedBridgeServer) handleStop(w http.ResponseWriter, r *http.Request)
 	writeJSON(w, map[string]any{"key": key, "stopped": stopped})
 }
 
+// handleStopBus is what the frontend calls when the operator switches away
+// from a bus: it releases that bus's now-viewerless channels immediately
+// instead of leaving them to idleGrace, freeing their vendor capacity slots
+// for whichever bus is being switched to. See flvHub.ExpediteBus — it never
+// touches a channel someone else is still watching.
+func (u *unifiedBridgeServer) handleStopBus(w http.ResponseWriter, r *http.Request) {
+	bus := r.URL.Query().Get("bus")
+	if bus == "" {
+		http.Error(w, "bus query parameter is required", http.StatusBadRequest)
+		return
+	}
+	u.hub.ExpediteBus(bus)
+	writeJSON(w, map[string]any{"bus": bus})
+}
+
 // handleHub reports what every FLV channel is doing right now.
 func (u *unifiedBridgeServer) handleHub(w http.ResponseWriter, _ *http.Request) {
 	writeJSON(w, u.hub.stats())
@@ -190,9 +205,11 @@ func writeBridgeError(w http.ResponseWriter, err error) {
 			// "try again once another camera's viewers go idle," not
 			// "something is broken." A slot frees on its own once a
 			// channel's last viewer leaves and the hub's idleGrace lapses
-			// (see flvHub.onChannelClosed) — there is no manual "stop
-			// another stream" action that speeds this up, since
-			// POST /api/bridge/stop is a no-op for kind: flv server-side.
+			// (see flvHub.onChannelClosed) — POST /api/bridge/stop is still
+			// a no-op for kind: flv (a single channel may have other
+			// viewers). POST /api/bridge/stop-bus is the one action that
+			// speeds this up: it releases a whole bus's now-viewerless
+			// channels immediately, for exactly this switching-buses case.
 			http.Error(w, err.Error(), http.StatusServiceUnavailable)
 		default:
 			http.Error(w, err.Error(), http.StatusBadGateway)

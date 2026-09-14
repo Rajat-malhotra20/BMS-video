@@ -168,6 +168,10 @@ func main() {
 	// session, which exists with no ingest side at all. GET /api/bridge
 	// lists ingest remux jobs only, so it is empty by construction here.
 	mux.HandleFunc("POST /api/bridge/stop", ubrs.handleStop)
+	// Bus-level counterpart to /stop: called on switching away from a bus
+	// in the UI, so that bus's now-viewerless channels free their vendor
+	// capacity slots immediately instead of idling out. See handleStopBus.
+	mux.HandleFunc("POST /api/bridge/stop-bus", ubrs.handleStopBus)
 	if ingestEnabled {
 		mux.HandleFunc("GET /api/bridge", ubrs.handleList)
 	}

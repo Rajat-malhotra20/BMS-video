@@ -491,6 +491,68 @@ func (h *flvHub) release(c *flvChannel) {
 	})
 }
 
+// ExpediteBus tears down every channel of bus that currently has zero
+// viewers, right now, instead of waiting idleGrace out.
+//
+// idleGrace exists to protect a *reconnect* — a page reload or a brief
+// network blip that comes straight back to the same channel — from paying
+// for a new device session (see idleGrace's doc, and the DLPD8611 incident
+// it cites). That protection doesn't apply when a client is switching to a
+// DIFFERENT bus entirely: there is nothing to reconnect to on this bus, so
+// holding the slot for another minute only starves the bus being switched
+// to. Called when the frontend navigates away from a bus.
+//
+// Only ever touches channels already at zero holders — a camera still
+// being watched by another viewer (a second tab, another operator) is left
+// completely alone, exactly as release()'s own idle check would leave it.
+// This can never disconnect an active viewer.
+func (h *flvHub) ExpediteBus(bus string) {
+	h.mu.Lock()
+	var idle []*flvChannel
+	for _, c := range h.chans {
+		b, _, ok := parseBusPath(c.key)
+		if !ok || b != bus {
+			continue
+		}
+		c.mu.RLock()
+		zero := c.holders == 0
+		c.mu.RUnlock()
+		if zero {
+			idle = append(idle, c)
+		}
+	}
+	for _, c := range idle {
+		// Same identity check release()'s own AfterFunc uses: only remove a
+		// channel that is still the live entry for its id (nothing else
+		// replaced or already removed it since the scan above).
+		if h.chans[c.id()] == c {
+			delete(h.chans, c.id())
+			c.cancel()
+			log.Printf("flv hub: %s: bus switch, released early (skipped idle grace)", c.label())
+		}
+	}
+	closedKeys := make(map[string]bool, len(idle))
+	for _, c := range idle {
+		closedKeys[c.key] = true
+	}
+	stillOpen := make(map[string]bool, len(h.chans))
+	for _, c := range h.chans {
+		stillOpen[c.key] = true
+	}
+	h.mu.Unlock()
+
+	if h.onChannelClosed == nil {
+		return
+	}
+	// Same rule as release(): only fire once no other quality of this
+	// camera is still open.
+	for key := range closedKeys {
+		if !stillOpen[key] {
+			h.onChannelClosed(key)
+		}
+	}
+}
+
 func (c *flvChannel) hold() {
 	c.mu.Lock()
 	c.holders++

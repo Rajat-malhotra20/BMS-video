@@ -1,0 +1,581 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8">
+<title>BMS API + Stream Tester</title>
+<script src="https://cdn.jsdelivr.net/npm/mpegts.js@1.7.3/dist/mpegts.js"></script>
+<script src="https://cdn.jsdelivr.net/npm/hls.js@1/dist/hls.min.js"></script>
+<style>
+  body { font-family: system-ui, sans-serif; background: #111; color: #eee; margin: 0; padding: 16px; }
+  h1 { font-size: 16px; margin: 0 0 4px; }
+  h2 { font-size: 13px; margin: 20px 0 8px; color: #93c5fd; border-bottom: 1px solid #333; padding-bottom: 4px; }
+  small.hint { color: #6b7280; display: block; margin-bottom: 12px; }
+  .row { display: flex; gap: 8px; margin: 6px 0; align-items: center; flex-wrap: wrap; }
+  input, select {
+    background: #1a1a1a; color: #eee; border: 1px solid #444; border-radius: 4px;
+    padding: 6px 8px; font-size: 12px; font-family: monospace;
+  }
+  textarea {
+    width: 100%; min-height: 60px; box-sizing: border-box; background: #1a1a1a; color: #dfd;
+    border: 1px solid #444; border-radius: 4px; padding: 8px; font-family: monospace; font-size: 12px;
+  }
+  button { background: #2563eb; color: #fff; border: none; border-radius: 4px; padding: 7px 14px; cursor: pointer; font-size: 12px; }
+  button:hover { background: #1d4ed8; }
+  button.danger { background: #b91c1c; }
+  button.danger:hover { background: #991b1b; }
+  .card { background: #161616; border: 1px solid #2a2a2a; border-radius: 6px; padding: 12px; margin-bottom: 10px; }
+  .status { font-size: 11px; margin-left: 4px; }
+  .ok { color: #4ade80; }
+  .err { color: #f87171; }
+  pre {
+    background: #0d0d0d; color: #d1fae5; border: 1px solid #333; border-radius: 4px;
+    padding: 8px; font-size: 11px; max-height: 300px; overflow: auto; white-space: pre-wrap; word-break: break-all;
+  }
+  label { font-size: 11px; color: #9ca3af; }
+  #grid { display: grid; grid-template-columns: repeat(auto-fill, minmax(320px, 1fr)); gap: 10px; margin-top: 10px; }
+  figure { margin: 0; background: #000; border: 1px solid #333; border-radius: 4px; overflow: hidden; }
+  video, iframe { width: 100%; aspect-ratio: 16/9; display: block; background: #000; border: 0; }
+  figcaption {
+    display: flex; justify-content: space-between; padding: 4px 8px; font-size: 12px;
+    background: #1a1a1a; color: #ccc;
+  }
+</style>
+</head>
+<body>
+
+<h1>BMS API + Stream Tester</h1>
+<small class="hint">
+  Calls the fleet-bms backend directly from the browser. Set the API base and,
+  if the server has API_TOKEN configured, the token — every request below
+  (JSON calls and video fetches alike) sends it as
+  <code>Authorization: Bearer &lt;token&gt;</code>.
+</small>
+
+<div class="card">
+  <div class="row">
+    <label>API base</label>
+    <input id="apiBase" placeholder="http://localhost:8080" style="width:240px" />
+    <label>Token (optional)</label>
+    <input id="token" placeholder="API_TOKEN" style="width:200px" />
+  </div>
+</div>
+
+<h2>Health</h2>
+<div class="card">
+  <div class="row">
+    <button data-call="health">GET /health</button>
+    <span class="status" data-status="health"></span>
+  </div>
+  <pre data-out="health"></pre>
+</div>
+
+<h2>Fleet</h2>
+<div class="card">
+  <div class="row">
+    <button data-call="fleet">GET /api/fleet</button>
+    <span class="status" data-status="fleet"></span>
+  </div>
+  <pre data-out="fleet"></pre>
+</div>
+
+<div class="card">
+  <div class="row">
+    <label>bus id</label>
+    <input id="busDetailId" placeholder="e.g. DL1PD8587" style="width:160px" />
+    <button data-call="busDetail">GET /api/bus/{id}</button>
+    <span class="status" data-status="busDetail"></span>
+  </div>
+  <pre data-out="busDetail"></pre>
+</div>
+
+<h2>Video: Go Live (auto-refresh)</h2>
+<div class="card">
+  <small class="hint">
+    Fetches <code>GET /api/stream/{busId}</code> itself, then keeps every channel
+    alive by re-fetching a fresh <code>directUrl</code> on a timer (before the vendor's
+    short-lived token expires) and on player error. "Stop All" also calls
+    <code>POST /api/bridge/stop</code> per channel so the backend's capacity slot
+    frees immediately.
+  </small>
+  <div class="row">
+    <label>bus id</label>
+    <input id="liveBusId" placeholder="bus id" style="width:160px" />
+    <button id="goLive">Go Live</button>
+    <button class="danger" id="stopAllBtn">Stop All</button>
+    <span id="liveStatus" class="status"></span>
+  </div>
+</div>
+
+<h2>Video: manual paste-and-play</h2>
+<div class="card">
+  <small class="hint">
+    Paste the RAW response body of <code>GET /api/stream/{busId}</code> —
+    either unparsed JSON text or already-parsed JSON — and play it without
+    auto-refresh. Re-paste to reconnect a dead URL.
+  </small>
+  <textarea id="input" placeholder='[{"cam":1,"path":"DL1PD8587_1","ready":true,"kind":"flv","directUrl":"https://..."}]'></textarea>
+  <div class="row">
+    <button id="go">Parse &amp; Play</button>
+    <span id="parseStatus" class="status"></span>
+  </div>
+</div>
+
+<div id="grid"></div>
+
+<h2>Stream API (raw JSON only)</h2>
+<div class="card">
+  <div class="row">
+    <label>bus id</label>
+    <input id="streamBusId" placeholder="e.g. DL1PD8587" style="width:160px" />
+    <label>cam (optional)</label>
+    <input id="streamCam" placeholder="1" style="width:60px" />
+    <button data-call="stream">GET /api/stream/{id}</button>
+    <span class="status" data-status="stream"></span>
+  </div>
+  <pre data-out="stream"></pre>
+</div>
+
+<h2>Bridge (unified)</h2>
+<div class="card">
+  <div class="row">
+    <label>bus</label>
+    <input id="bridgeBus" placeholder="bus id" style="width:140px" />
+    <label>cam</label>
+    <input id="bridgeCam" placeholder="1" style="width:50px" />
+    <label><input type="checkbox" id="bridgeMain" /> main</label>
+    <label><input type="checkbox" id="bridgeAudio" /> audio</label>
+    <button data-call="bridgeStart">POST /api/bridge/start</button>
+    <span class="status" data-status="bridgeStart"></span>
+  </div>
+  <pre data-out="bridgeStart"></pre>
+
+  <div class="row">
+    <label>key</label>
+    <input id="bridgeStopKey" placeholder="bus_cam" style="width:140px" />
+    <button class="danger" data-call="bridgeStop">POST /api/bridge/stop</button>
+    <span class="status" data-status="bridgeStop"></span>
+  </div>
+  <pre data-out="bridgeStop"></pre>
+
+  <div class="row">
+    <button data-call="bridgeList">GET /api/bridge</button>
+    <span class="status" data-status="bridgeList"></span>
+  </div>
+  <pre data-out="bridgeList"></pre>
+
+  <div class="row">
+    <button data-call="hub">GET /api/hub</button>
+    <span class="status" data-status="hub"></span>
+  </div>
+  <pre data-out="hub"></pre>
+</div>
+
+<h2>SumithLive</h2>
+<div class="card">
+  <div class="row">
+    <label>request body (JSON)</label>
+  </div>
+  <textarea id="sumithStartBody" placeholder='{"plate":"DL1PD8587"}'></textarea>
+  <div class="row">
+    <button data-call="sumithStart">POST /api/bridge/sumithlive/start</button>
+    <span class="status" data-status="sumithStart"></span>
+  </div>
+  <pre data-out="sumithStart"></pre>
+
+  <div class="row">
+    <button data-call="sumithVehicles">GET /api/bridge/sumithlive/vehicles</button>
+    <span class="status" data-status="sumithVehicles"></span>
+  </div>
+  <pre data-out="sumithVehicles"></pre>
+</div>
+
+<script>
+// ---------- shared helpers ----------
+function base() {
+  let b = document.getElementById("apiBase").value.trim().replace(/\/$/, "");
+  // A bare host (no http:// or https://) is otherwise resolved by the
+  // browser as a path relative to this file's own file:// URL instead of
+  // an absolute request — default it to https so plain hostnames work.
+  if (b && !/^https?:\/\//i.test(b)) b = "https://" + b;
+  return b;
+}
+function authHeaders() {
+  const t = document.getElementById("token").value.trim();
+  return t ? { "Authorization": "Bearer " + t } : {};
+}
+function setStatus(name, ok, msg) {
+  const el = document.querySelector(`[data-status="${name}"]`);
+  el.textContent = msg;
+  el.className = "status " + (ok ? "ok" : "err");
+}
+function setOut(name, text) {
+  document.querySelector(`[data-out="${name}"]`).textContent = text;
+}
+
+async function call(name, path, opts = {}) {
+  const b = base();
+  if (!b) { setStatus(name, false, "set API base first"); return; }
+  setStatus(name, undefined, "...");
+  try {
+    const res = await fetch(b + path, {
+      method: opts.method || "GET",
+      headers: { ...authHeaders(), ...(opts.body ? { "Content-Type": "application/json" } : {}) },
+      body: opts.body,
+    });
+    const text = await res.text();
+    let pretty = text;
+    try { pretty = JSON.stringify(JSON.parse(text), null, 2); } catch (e) {}
+    setOut(name, pretty || "(empty body)");
+    setStatus(name, res.ok, `${res.status} ${res.statusText}`);
+  } catch (e) {
+    setOut(name, String(e));
+    setStatus(name, false, "request failed");
+  }
+}
+
+const actions = {
+  health: () => call("health", "/health"),
+  fleet: () => call("fleet", "/api/fleet"),
+  busDetail: () => {
+    const id = document.getElementById("busDetailId").value.trim();
+    if (!id) return setStatus("busDetail", false, "bus id required");
+    call("busDetail", `/api/bus/${encodeURIComponent(id)}`);
+  },
+  stream: () => {
+    const id = document.getElementById("streamBusId").value.trim();
+    const cam = document.getElementById("streamCam").value.trim();
+    if (!id) return setStatus("stream", false, "bus id required");
+    const q = cam ? `?cam=${encodeURIComponent(cam)}` : "";
+    call("stream", `/api/stream/${encodeURIComponent(id)}${q}`);
+  },
+  bridgeStart: () => {
+    const bus = document.getElementById("bridgeBus").value.trim();
+    const cam = parseInt(document.getElementById("bridgeCam").value.trim(), 10);
+    if (!bus || Number.isNaN(cam)) return setStatus("bridgeStart", false, "bus and cam required");
+    const body = JSON.stringify({
+      bus, cam,
+      main: document.getElementById("bridgeMain").checked,
+      audio: document.getElementById("bridgeAudio").checked,
+    });
+    call("bridgeStart", "/api/bridge/start", { method: "POST", body });
+  },
+  bridgeStop: () => {
+    const key = document.getElementById("bridgeStopKey").value.trim();
+    if (!key) return setStatus("bridgeStop", false, "key required");
+    call("bridgeStop", `/api/bridge/stop?key=${encodeURIComponent(key)}`, { method: "POST" });
+  },
+  bridgeList: () => call("bridgeList", "/api/bridge"),
+  hub: () => call("hub", "/api/hub"),
+  sumithStart: () => {
+    const raw = document.getElementById("sumithStartBody").value.trim();
+    call("sumithStart", "/api/bridge/sumithlive/start", { method: "POST", body: raw || "{}" });
+  },
+  sumithVehicles: () => call("sumithVehicles", "/api/bridge/sumithlive/vehicles"),
+};
+
+document.querySelectorAll("[data-call]").forEach(btn => {
+  btn.addEventListener("click", () => actions[btn.dataset.call]());
+});
+
+// ---------- video: shared grid/player machinery ----------
+const grid = document.getElementById("grid");
+let players = []; // mpegts/hls instances so "Stop All" can tear them down
+
+// Live sessions started via "Go Live" — separate from `players` because
+// each one owns a refresh timer and a backend key that needs an explicit
+// POST /api/bridge/stop, not just a player .destroy().
+let liveSessions = [];
+
+function stopAll() {
+  for (const p of players) {
+    try { p.destroy ? p.destroy() : p.stopLoad(); } catch (e) {}
+  }
+  players = [];
+  for (const s of liveSessions) s.stop();
+  liveSessions = [];
+  grid.innerHTML = "";
+}
+
+function setLiveStatus(msg, ok) {
+  const el = document.getElementById("liveStatus");
+  el.textContent = msg;
+  el.className = "status " + (ok === undefined ? "" : (ok ? "ok" : "err"));
+}
+function setParseStatus(msg, ok) {
+  const el = document.getElementById("parseStatus");
+  el.textContent = msg;
+  el.className = "status " + (ok === undefined ? "" : (ok ? "ok" : "err"));
+}
+
+// One entry can be a single stream object or GET /api/stream/{id} returning an array.
+// Also accept a raw pasted directUrl string, wrapped as one flv entry, so a single
+// URL can be dropped in without fabricating the surrounding JSON.
+function normalize(parsed) {
+  if (Array.isArray(parsed)) return parsed;
+  if (typeof parsed === "string") return [{ cam: "?", kind: "flv", directUrl: parsed, ready: true }];
+  return [parsed];
+}
+
+// directUrl for flv/hls proxied through our own backend (e.g. "/api/flv/{key}")
+// comes back as a path relative to the API, not this static page — resolve it
+// against the configured API base. It also sits behind the same requireToken
+// middleware as every other route, and neither mpegts.js's fetch loader nor a
+// plain <video>/hls.js request attaches our Authorization header, so the token
+// is appended as a query param instead (the same fallback auth.go documents
+// for browsers that can't set headers).
+function resolveStreamUrl(directUrl) {
+  if (!directUrl) return directUrl;
+  let abs = directUrl;
+  if (!/^https?:\/\//i.test(directUrl)) {
+    const b = base();
+    abs = directUrl.startsWith("/") ? b + directUrl : b + "/" + directUrl;
+  }
+  const t = document.getElementById("token").value.trim();
+  if (t) {
+    abs += (abs.includes("?") ? "&" : "?") + "token=" + encodeURIComponent(t);
+  }
+  return abs;
+}
+
+function play(cam, video, note, attempt = 0) {
+  const url = resolveStreamUrl(cam.directUrl);
+  if (cam.kind === "flv") {
+    if (!mpegts.isSupported()) { note.textContent = "MSE unsupported in this browser"; return; }
+    const p = mpegts.createPlayer(
+      { type: "flv", isLive: true, url },
+      { liveBufferLatencyChasing: true },
+    );
+    p.attachMediaElement(video);
+    p.load();
+    p.play().catch(() => {});
+
+    // Chemito's live-video token is single-use/short-lived and the device can't
+    // close a session on its own — a tight retry loop leaves phantom sessions
+    // open and can take the device offline (see HOW_TO_USE.md). Back off instead
+    // of resuming: give up after a handful of tries rather than retrying forever.
+    p.on(mpegts.Events.ERROR, (type, detail) => {
+      p.destroy();
+      if (attempt >= 5) {
+        note.innerHTML = `<span class="err">${type}/${detail} — gave up (re-paste a fresh URL to retry)</span>`;
+        return;
+      }
+      const wait = Math.min(30000, 3000 * 2 ** attempt);
+      note.innerHTML = `<span class="err">${type}/${detail} — this URL is now dead, ${wait / 1000}s</span>`;
+      // NOT auto-retried with the same URL: a dead FLV token can't be resumed,
+      // it needs a fresh /api/stream call, which this static page can't make on
+      // its own. Re-paste a fresh response to try again.
+    });
+    p.on(mpegts.Events.MEDIA_INFO, (mi) => {
+      note.innerHTML = `<span class="ok">live · ${mi.videoCodec || ""} ${mi.width || "?"}x${mi.height || "?"}</span>`;
+    });
+    players.push(p);
+
+  } else if (cam.kind === "hls") {
+    if (window.Hls && Hls.isSupported()) {
+      const hls = new Hls();
+      hls.loadSource(url);
+      hls.attachMedia(video);
+      hls.on(Hls.Events.ERROR, (_, data) => {
+        if (data.fatal) note.innerHTML = `<span class="err">${data.type}</span>`;
+      });
+      hls.on(Hls.Events.MANIFEST_PARSED, () => {
+        note.innerHTML = `<span class="ok">live</span>`;
+        video.play().catch(() => {});
+      });
+      players.push(hls);
+    } else {
+      // Safari plays HLS natively via <video src>, no library needed.
+      video.src = url;
+      video.addEventListener("loadedmetadata", () => note.innerHTML = `<span class="ok">live</span>`);
+      video.addEventListener("error", () => note.innerHTML = `<span class="err">video error</span>`);
+    }
+
+  } else if (cam.kind === "embed") {
+    note.textContent = "embed (iframe)";
+  } else {
+    note.innerHTML = `<span class="err">unknown kind: ${cam.kind}</span>`;
+  }
+}
+
+// --- Auto mode: fetch directUrl ourselves and keep it fresh ---
+//
+// Chemito's live-video URL is single-use/short-lived (~180s, confirmed
+// against the live account) and the backend re-resolves fresh on every
+// GET /api/stream/{id} call — it never hands out a URL that's already been
+// used. So staying live means re-fetching before that window closes, not
+// waiting for the player to error out (an expiry can go silent — frozen
+// last frame, no ERROR event at all).
+const REFRESH_MS = 150_000; // refetch at 150s, margin before the ~180s expiry
+const RETRY_BACKOFF = [3000, 6000, 12000, 24000, 30000]; // same shape as the manual-mode backoff above
+
+async function fetchCam(apiBase, busId, camNum) {
+  const res = await fetch(`${apiBase}/api/stream/${encodeURIComponent(busId)}?cam=${camNum}`, {
+    headers: authHeaders(),
+  });
+  if (!res.ok) throw new Error(`GET /api/stream/${busId}?cam=${camNum}: ${res.status}`);
+  const body = await res.json();
+  const cams = normalize(body);
+  const cam = cams.find(c => c.cam === camNum) ?? cams[0];
+  if (!cam || !cam.directUrl) throw new Error("no directUrl in response");
+  return cam;
+}
+
+// One live channel: owns its player, its refresh/backoff timer, and the
+// backend key so it can tell the server it's done. Mirrors the reconnect
+// shape from the manual-mode ERROR handler, but proactive instead of
+// error-only, and it can actually refetch since this page is making the
+// /api/stream call itself now.
+function runChannel(apiBase, busId, camNum, video, note) {
+  const key = `${busId}_${camNum}`;
+  let player, timer, attempt = 0, stopped = false;
+
+  function teardown() {
+    clearTimeout(timer);
+    try { player?.destroy ? player.destroy() : player?.stopLoad?.(); } catch (e) {}
+    player = null;
+  }
+
+  async function connect() {
+    if (stopped) return;
+    teardown();
+    try {
+      const cam = await fetchCam(apiBase, busId, camNum);
+      const url = resolveStreamUrl(cam.directUrl);
+      player = mpegts.isSupported() && cam.kind === "flv"
+        ? mpegts.createPlayer({ type: "flv", isLive: true, url }, { liveBufferLatencyChasing: true })
+        : null;
+      if (!player) { note.innerHTML = `<span class="err">kind ${cam.kind} not supported in auto mode</span>`; return; }
+
+      player.attachMediaElement(video);
+      player.load();
+      player.play().catch(() => {});
+
+      player.on(mpegts.Events.ERROR, (type, detail) => {
+        note.innerHTML = `<span class="err">${type}/${detail} — reconnecting</span>`;
+        scheduleReconnect();
+      });
+      player.on(mpegts.Events.MEDIA_INFO, (mi) => {
+        attempt = 0; // a real connect succeeded — reset backoff
+        note.innerHTML = `<span class="ok">live · ${mi.videoCodec || ""} ${mi.width || "?"}x${mi.height || "?"}</span>`;
+      });
+
+      clearTimeout(timer);
+      timer = setTimeout(connect, REFRESH_MS); // proactive: refetch before expiry, not after an error
+    } catch (e) {
+      note.innerHTML = `<span class="err">${e.message}</span>`;
+      scheduleReconnect();
+    }
+  }
+
+  function scheduleReconnect() {
+    if (stopped) return;
+    teardown();
+    const wait = RETRY_BACKOFF[Math.min(attempt, RETRY_BACKOFF.length - 1)];
+    attempt++;
+    note.innerHTML = `<span class="err">retrying in ${wait / 1000}s</span>`;
+    timer = setTimeout(connect, wait);
+  }
+
+  connect();
+
+  return {
+    stop() {
+      stopped = true;
+      teardown();
+      // Tell the backend this channel is done so it releases the capacity
+      // slot immediately (see StreamService.StopStream / vendors.Releaser)
+      // instead of leaving it held until activeSlotTTL lapses.
+      fetch(`${apiBase}/api/bridge/stop?key=${encodeURIComponent(key)}`, {
+        method: "POST",
+        headers: authHeaders(),
+      }).catch(() => {});
+    },
+  };
+}
+
+document.getElementById("goLive").onclick = async () => {
+  stopAll();
+  const apiBase = base();
+  const busId = document.getElementById("liveBusId").value.trim();
+  if (!apiBase || !busId) { setLiveStatus("API base and bus id are both required", false); return; }
+
+  setLiveStatus("starting…");
+  let cams;
+  try {
+    const res = await fetch(`${apiBase}/api/stream/${encodeURIComponent(busId)}`, { headers: authHeaders() });
+    if (!res.ok) throw new Error(`GET /api/stream/${busId}: ${res.status}`);
+    cams = normalize(await res.json());
+  } catch (e) {
+    setLiveStatus("failed to start: " + e.message, false);
+    return;
+  }
+  setLiveStatus(`${cams.length} channel${cams.length === 1 ? "" : "s"} live`, true);
+
+  for (const cam of cams) {
+    const fig = document.createElement("figure");
+    const cap = document.createElement("figcaption");
+    const label = document.createElement("span");
+    label.textContent = `cam ${cam.cam ?? "?"} · auto`;
+    const note = document.createElement("span");
+    cap.append(label, note);
+
+    const video = document.createElement("video");
+    video.muted = true;
+    video.autoplay = true;
+    video.controls = true;
+    fig.append(video, cap);
+    grid.append(fig);
+
+    liveSessions.push(runChannel(apiBase, busId, cam.cam, video, note));
+  }
+};
+
+document.getElementById("stopAllBtn").onclick = stopAll;
+
+document.getElementById("go").onclick = () => {
+  stopAll();
+  const raw = document.getElementById("input").value.trim();
+  if (!raw) { setParseStatus("paste something first", false); return; }
+
+  let parsed;
+  try {
+    parsed = JSON.parse(raw);
+  } catch (e) {
+    setParseStatus("not valid JSON: " + e.message, false);
+    return;
+  }
+
+  const cams = normalize(parsed);
+  setParseStatus(`${cams.length} entr${cams.length === 1 ? "y" : "ies"} parsed`, true);
+
+  for (const cam of cams) {
+    const fig = document.createElement("figure");
+    const cap = document.createElement("figcaption");
+    const label = document.createElement("span");
+    label.textContent = `cam ${cam.cam ?? "?"} · ${cam.kind || "?"}`;
+    const note = document.createElement("span");
+    cap.append(label, note);
+
+    let media;
+    if (cam.kind === "embed") {
+      media = document.createElement("iframe");
+      media.src = resolveStreamUrl(cam.directUrl);
+    } else {
+      media = document.createElement("video");
+      media.muted = true;
+      media.autoplay = true;
+      media.controls = true;
+    }
+    fig.append(media, cap);
+    grid.append(fig);
+
+    if (!cam.directUrl) {
+      note.innerHTML = `<span class="err">no directUrl on this entry</span>`;
+      continue;
+    }
+    play(cam, media, note);
+  }
+};
+</script>
+</body>
+</html>
