@@ -316,12 +316,23 @@ func (a *Adapter) ResolveLiveSource(ctx context.Context, req domain.StreamReques
 		st = rawclient.LiveStreamMain
 	}
 
-	// Always request audio=1 from the vendor, regardless of req.Audio:
-	// Chemito's FLV header claims audio even when asked for audio=0 and
-	// then sends no audio tags at all, which stalls a player that trusts
-	// the header. That mismatch only exists in the audio=0 case, so
-	// asking for audio unconditionally sidesteps it — no header to lie
-	// about — at the cost of decoding an audio track callers may not want.
+	// req.Audio now travels through as asked, not forced to true. This used
+	// to always request audio=1 regardless of req.Audio, to sidestep
+	// Chemito's FLV header claiming audio even when none was requested and
+	// arrives (a player that trusts the header hangs waiting for a track
+	// that never comes). That workaround predates flvhub.go's own fix for
+	// the same bug (see pumpOnce's "header's audio bit is committed from
+	// what the stream actually carries" — added after a live incident on
+	// this exact vendor, DL1PD8587): the hub now holds the header until an
+	// actual audio tag proves the camera has a mic, or a probe window
+	// expires, and rewrites the header to match reality either way. That
+	// makes forcing audio=1 here redundant, and not free: every one of a
+	// bus's 9 grid-tile requests (which explicitly ask audio=0) was paying
+	// for full audio+video bandwidth over a vehicle's likely-limited
+	// cellular uplink for a track the viewer immediately discards. Honoring
+	// the real request should let more of a bus's channels actually fit
+	// within that link's real bandwidth instead of competing for it
+	// unnecessarily.
 	//
 	// slotKey (not channelKey) is what acquireSlot/Release account against,
 	// and it MUST be req.Bus-based — that is the exact string flvHub hands
@@ -344,7 +355,7 @@ func (a *Adapter) ResolveLiveSource(ctx context.Context, req domain.StreamReques
 		if err := a.acquireSlot(slotKey); err != nil {
 			return "", err
 		}
-		return a.resolveURL(terid, channel, true, st)
+		return a.resolveURL(terid, channel, req.Audio, st)
 	}
 
 	return domain.LiveSource{Kind: domain.KindFLV, Upstream: upstream, HasAudio: true}, nil

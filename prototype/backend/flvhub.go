@@ -218,6 +218,26 @@ const (
 	flvReconnectMin = 200 * time.Millisecond
 	flvReconnectMax = 5 * time.Second
 
+	// flvReconnectMaxSustained is a second, bigger ceiling for a channel
+	// that has been retrying for a long stretch WITHOUT EVER delivering a
+	// single frame — as opposed to a previously-live channel recovering
+	// from a drop, which still gets the fast flvReconnectMax ceiling above.
+	// Confirmed live: an account's vendor-side session handling can degrade
+	// to repeated HTTP 408/502 on a channel for 5+ minutes straight, each
+	// attempt itself taking ~15s (the vendor's own device-poll timeout, not
+	// something our backoff controls) - retrying every 5s on top of that
+	// doesn't get video any sooner, it just spends more of the account's
+	// scarce concurrent-session budget on a channel that isn't using it
+	// productively, budget a channel that IS streaming needs (see
+	// chemitoapi.maxActiveChannels' doc: this account's usable ceiling in
+	// practice runs well below what it's nominally entitled to).
+	flvReconnectMaxSustained = 30 * time.Second
+
+	// flvSustainedFailureAfter is how many consecutive connects a channel
+	// can fail (never delivering a frame) before the loop switches from
+	// flvReconnectMax to the bigger flvReconnectMaxSustained ceiling above.
+	flvSustainedFailureAfter = 8
+
 	// flvFirstByteTimeout is how long a viewer waits for a channel that
 	// has never produced video before being told it's unavailable. Only
 	// applies before the first byte — once a viewer is receiving, it is
@@ -589,6 +609,8 @@ func (c *flvChannel) unsubscribe(s *flvSub) {
 // run is the single reconnect loop for this channel.
 func (c *flvChannel) run(ctx context.Context) {
 	backoff := flvReconnectMin
+	everDelivered := false
+	consecutiveFailures := 0
 	for ctx.Err() == nil {
 		delivered, err := c.pumpOnce(ctx)
 		if ctx.Err() != nil {
@@ -598,7 +620,11 @@ func (c *flvChannel) run(ctx context.Context) {
 		c.reconnects++
 		c.mu.Unlock()
 		if delivered {
+			everDelivered = true
+			consecutiveFailures = 0
 			backoff = flvReconnectMin // a working connection earns a fast retry
+		} else {
+			consecutiveFailures++
 		}
 		c.noteErr(err)
 		select {
@@ -606,8 +632,20 @@ func (c *flvChannel) run(ctx context.Context) {
 			return
 		case <-time.After(backoff):
 		}
-		if backoff *= 2; backoff > flvReconnectMax {
-			backoff = flvReconnectMax
+		// A channel that has never once streamed and has failed this many
+		// times in a row is not a signal blip - back off much further
+		// instead of spending the account's scarce concurrent-session
+		// budget retrying every few seconds (see flvReconnectMaxSustained).
+		ceiling := flvReconnectMax
+		if !everDelivered && consecutiveFailures >= flvSustainedFailureAfter {
+			if consecutiveFailures == flvSustainedFailureAfter {
+				log.Printf("flv hub: %s: %d consecutive failed connects with no frame ever delivered, backing off up to %s instead of %s",
+					c.label(), consecutiveFailures, flvReconnectMaxSustained, flvReconnectMax)
+			}
+			ceiling = flvReconnectMaxSustained
+		}
+		if backoff *= 2; backoff > ceiling {
+			backoff = ceiling
 		}
 	}
 }
