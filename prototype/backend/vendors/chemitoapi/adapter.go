@@ -322,13 +322,26 @@ func (a *Adapter) ResolveLiveSource(ctx context.Context, req domain.StreamReques
 	// the header. That mismatch only exists in the audio=0 case, so
 	// asking for audio unconditionally sidesteps it — no header to lie
 	// about — at the cost of decoding an audio track callers may not want.
-	channelKey := terid + "_" + strconv.Itoa(channel)
+	//
+	// slotKey (not channelKey) is what acquireSlot/Release account against,
+	// and it MUST be req.Bus-based — that is the exact string flvHub hands
+	// back to Release via onChannelClosed(c.key) (bridge_unified.go), since
+	// the hub only ever knows channels by {bus}_{cam}, never by terid. Using
+	// the vendor's terid here instead (as this used to) meant every acquired
+	// slot was released under a key that was never in a.active — silently
+	// leaking one held slot per channel forever, until the account-wide
+	// cap was permanently pinned at maxActiveChannels with no way to free
+	// it short of a process restart. Confirmed live 2026-09-14: "channel(s)
+	// currently held by this process" climbed to 16 and never came back
+	// down across several bus switches, even though flvHub was logging
+	// "released early" for every one of them.
+	slotKey := req.Bus + "_" + strconv.Itoa(channel)
 	upstream := func(ctx context.Context) (string, error) {
 		// Gate before ever calling the vendor: acquireSlot renews an
 		// already-held slot on every reconnect, and only rejects a channel
 		// that would push the account past maxActiveChannels. See its doc
 		// for why this stops short of the account's real 16-channel limit.
-		if err := a.acquireSlot(channelKey); err != nil {
+		if err := a.acquireSlot(slotKey); err != nil {
 			return "", err
 		}
 		return a.resolveURL(terid, channel, true, st)
