@@ -584,6 +584,29 @@ func (a *apiServer) ensureAllCams(ctx context.Context, bus string, have []stream
 		seen[si.Cam] = true
 	}
 
+	// Fetched once up front, not per candidate cam: each entry is
+	// independent of the others, so a stale read of the same snapshot for
+	// every cam is fine, and it turns an O(n*m) scan into O(n+m).
+	var directByKey map[string]services.DirectEntry
+	if a.directKeys != nil {
+		entries := a.directKeys()
+		directByKey = make(map[string]services.DirectEntry, len(entries))
+		for _, e := range entries {
+			directByKey[e.Key] = e
+		}
+	}
+
+	// Each candidate cam's resolve is independent (its own vendor round
+	// trip, its own slot, its own error) — spent one at a time, resolving
+	// 9 cameras serially added their latencies together for no reason.
+	// Run them concurrently and collect into a fixed-size slice by index,
+	// so no two goroutines ever touch the same slot and no mutex is needed
+	// on the result itself.
+	type result struct {
+		cam int
+		si  *streamInfo
+	}
+	pending := make([]int, 0, n)
 	for cam := 1; cam <= n; cam++ {
 		if seen[cam] {
 			continue
@@ -601,27 +624,37 @@ func (a *apiServer) ensureAllCams(ctx context.Context, bus string, have []stream
 		// Check the live session map before starting: the fleet snapshot
 		// this result was built from is up to 2s stale, so a channel
 		// started moments ago is active but missing from `have`.
-		if a.directKeys != nil {
-			found := false
-			for _, e := range a.directKeys() {
-				if e.Key == key {
-					have = append(have, directEntryToInfo(e, cam))
-					found = true
-					break
-				}
-			}
-			if found {
-				continue
-			}
-		}
-
-		started, err := a.ensureStream(ctx, bus, cam)
-		if err != nil {
-			log.Printf("stream live: %s: %v", key, err)
+		if e, ok := directByKey[key]; ok {
+			have = append(have, directEntryToInfo(e, cam))
 			continue
 		}
-		if started != nil {
-			have = append(have, streamResultToInfo(*started, cam))
+
+		pending = append(pending, cam)
+	}
+
+	results := make([]result, len(pending))
+	var wg sync.WaitGroup
+	for i, cam := range pending {
+		wg.Add(1)
+		go func(i, cam int) {
+			defer wg.Done()
+			key := bus + "_" + strconv.Itoa(cam)
+			started, err := a.ensureStream(ctx, bus, cam)
+			if err != nil {
+				log.Printf("stream live: %s: %v", key, err)
+				return
+			}
+			if started != nil {
+				si := streamResultToInfo(*started, cam)
+				results[i] = result{cam: cam, si: &si}
+			}
+		}(i, cam)
+	}
+	wg.Wait()
+
+	for _, r := range results {
+		if r.si != nil {
+			have = append(have, *r.si)
 		}
 	}
 

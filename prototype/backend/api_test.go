@@ -6,8 +6,10 @@ import (
 	"fmt"
 	"net/http"
 	"net/http/httptest"
+	"sort"
 	"strconv"
 	"strings"
+	"sync"
 	"testing"
 
 	"mediamtx-console/domain"
@@ -268,9 +270,16 @@ func TestStreamLiveHandler_AllCamsStartsMissing(t *testing.T) {
 	defer mtx.Close()
 
 	api := newAPIServer(mtx.URL)
+	var startedMu sync.Mutex
 	var started []int
 	api.ensureStream = func(_ context.Context, bus string, cam int) (*domain.StreamResult, error) {
+		// Cams resolve concurrently now (see ensureAllCams), so this mock
+		// must be safe for concurrent calls, and the assertion below checks
+		// membership, not call order — order is legitimately
+		// nondeterministic, only the final (sorted) result isn't.
+		startedMu.Lock()
 		started = append(started, cam)
+		startedMu.Unlock()
 		if cam == 3 {
 			return nil, fmt.Errorf("camera %d is dead", cam) // must not blank the others
 		}
@@ -290,8 +299,9 @@ func TestStreamLiveHandler_AllCamsStartsMissing(t *testing.T) {
 	if err := json.Unmarshal(rec.Body.Bytes(), &got); err != nil {
 		t.Fatalf("bad json: %v", err)
 	}
-	if len(started) != 3 || started[0] != 2 || started[2] != 4 {
-		t.Fatalf("started = %v, want cams 2,3,4 (1 was already live)", started)
+	sort.Ints(started)
+	if len(started) != 3 || started[0] != 2 || started[1] != 3 || started[2] != 4 {
+		t.Fatalf("started = %v, want cams 2,3,4 in some order (1 was already live)", started)
 	}
 	if len(got) != 3 {
 		t.Fatalf("len(got) = %d, want 3 (cam 3 failed to start)", len(got))
@@ -315,9 +325,14 @@ func TestStreamLiveHandler_AllCamsUsesVendorChannelCount(t *testing.T) {
 
 	api := newAPIServer(mtx.URL)
 	api.channelCounts = func(context.Context) map[string]int { return map[string]int{"DL1PC0001": 9} }
+	var startedMu sync.Mutex
 	var started []int
 	api.ensureStream = func(_ context.Context, bus string, cam int) (*domain.StreamResult, error) {
+		// Cams resolve concurrently now (see ensureAllCams) - must be safe
+		// for concurrent calls.
+		startedMu.Lock()
 		started = append(started, cam)
+		startedMu.Unlock()
 		return &domain.StreamResult{Key: bus + "_" + strconv.Itoa(cam), Kind: domain.KindFLV}, nil
 	}
 
