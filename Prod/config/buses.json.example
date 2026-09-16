@@ -1,0 +1,10 @@
+{
+  "DL1PC0003": {
+    "vendor": "sumithlive",
+    "vendorParams": { "plateNo": "GJ03BZ0211", "projectId": "37" }
+  },
+  "DL1PD8584": {
+    "vendor": "chemitoapi",
+    "vendorParams": { "terid": "AE99873120" }
+  }
+}

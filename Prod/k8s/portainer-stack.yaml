@@ -1,0 +1,186 @@
+# Replaces prototype/k8s/portainer-stack.yaml — the Go+MediaMTX deployment
+# is being retired, this Python API takes over the same namespace, Service
+# name, and NodePort (30080) so nothing pointing at the old address needs to
+# change. See k8s/DEPLOY.md "Decommissioning the Go deployment" for the
+# one-time cutover steps (deleting the old Deployment/Services this file
+# does not replace: bms-video, bms-ingest, mediamtx-config).
+#
+# No mediamtx-config ConfigMap, no bms-ingest Service (no RTMP/WebRTC/N9M —
+# Prod only serves vendors that hand back a direct URL), no castmaster
+# entry (Prod doesn't implement it).
+
+apiVersion: v1
+kind: Namespace
+metadata:
+  name: bms-dev
+
+---
+# Vendor-less bridge config (see Prod/config/*.json.example). vendors.json's
+# passwords are deliberately left empty here — they come from the separate
+# vendor-credentials Secret instead, via VENDOR_<NAME>_PASSWORD env vars
+# (settings.py fills a blank password from that env var, same as Go's
+# config/vendors.go did). Edit buses.json here to add/reassign a bus; no
+# image rebuild needed, just `kubectl apply` + a rollout restart (mounted
+# config).
+#
+# Same ConfigMap NAME as the Go deployment used — reused, not duplicated.
+# This apply overwrites its contents (dropping castmaster/n9m entries,
+# which this API doesn't serve); that's the point of the cutover.
+apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: vendors-config
+  namespace: bms-dev
+data:
+  vendors.json: |
+    {
+      "sumithlive": { "baseUrl": "https://trakzee2.uffizio.com", "username": "vishvam@Login.com", "password": "", "extra": { "projectId": "37" } },
+      "chemitoapi": { "baseUrl": "https://itms-gateway.gna.energy:22056", "username": "media-live", "password": "" }
+    }
+  buses.json: |
+    {
+      "GJ03BZ0327": { "vendor": "sumithlive", "vendorParams": { "plateNo": "GJ03BZ0327", "projectId": "37" } },
+      "DLPD8611": { "vendor": "chemitoapi", "vendorParams": { "terid": "00C400403F" } }
+    }
+
+---
+# vendor-credentials (vendor passwords) and bms-api-auth (the API bearer
+# token) are NOT defined here on purpose, and are REUSED from the Go
+# deployment as-is — same names, same Secret objects, nothing to recreate.
+# The extra castmaster-password key left over in vendor-credentials is
+# simply unused now; harmless to leave or remove. See DEPLOY.md if either
+# secret doesn't exist yet.
+
+---
+# Single container: just the Python API — no MediaMTX, no ffmpeg, no
+# supervisord, so no localhost sidecar call and no second process to
+# supervise inside the pod.
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: bms-video
+  namespace: bms-dev
+spec:
+  replicas: 1
+  strategy:
+    type: Recreate   # one active vendor session per account — see DEPLOY.md
+  selector:
+    matchLabels:
+      app: bms-video
+  template:
+    metadata:
+      labels:
+        app: bms-video
+    spec:
+      # Same reachability caveat as the Go deployment: this node has no
+      # outbound internet, so vendor calls (Chemito, Sumith) get TCP RST
+      # there. Keep this pod off it too.
+      affinity:
+        nodeAffinity:
+          requiredDuringSchedulingIgnoredDuringExecution:
+            nodeSelectorTerms:
+              - matchExpressions:
+                  - key: kubernetes.io/hostname
+                    operator: NotIn
+                    values:
+                      - "ip-172-31-4-81"
+      imagePullSecrets:
+        - name: ecr-pull-secret
+      containers:
+        - name: bms-video
+          image: 475560691356.dkr.ecr.ap-south-1.amazonaws.com/bms/video-py/dev:latest
+          imagePullPolicy: Always
+          env:
+            - name: ADDR
+              value: "0.0.0.0"
+            - name: PORT
+              value: "8080"
+            # CORS for the JSON API. "*" is a placeholder — pin this to the
+            # real frontend origin before this is reachable from production.
+            - name: CORS_ALLOWED_ORIGIN
+              value: "*"
+            # Shared bearer token for every route except /health. Without
+            # it the API is open to anyone who can reach the NodePort.
+            # optional:true so a missing secret does not crash-loop the
+            # pod, it just leaves the API unauthenticated and says so in
+            # the log.
+            - name: API_TOKEN
+              valueFrom:
+                secretKeyRef:
+                  name: bms-api-auth
+                  key: token
+                  optional: true
+            - name: VENDORS_CONFIG
+              value: "/config/vendors.json"
+            - name: BUSES_CONFIG
+              value: "/config/buses.json"
+            # Passwords only — the rest of each vendor's config comes from
+            # the vendors-config ConfigMap (mounted below). A Secret, not a
+            # ConfigMap: these are live vendor credentials and a ConfigMap
+            # is readable by anyone with namespace read access.
+            - name: VENDOR_SUMITHLIVE_PASSWORD
+              valueFrom:
+                secretKeyRef:
+                  name: vendor-credentials
+                  key: sumithlive-password
+                  optional: true
+            - name: VENDOR_CHEMITOAPI_PASSWORD
+              valueFrom:
+                secretKeyRef:
+                  name: vendor-credentials
+                  key: chemitoapi-password
+                  optional: true
+          ports:
+            - containerPort: 8080
+              protocol: TCP   # the one API — GET /api/fleet, GET /api/stream/{id}, POST /api/stream/{id}/stop
+          volumeMounts:
+            - name: vendor-config
+              mountPath: /config
+          readinessProbe:
+            httpGet:
+              path: /health
+              port: 8080
+            initialDelaySeconds: 2
+            periodSeconds: 5
+          livenessProbe:
+            httpGet:
+              path: /health
+              port: 8080
+            initialDelaySeconds: 5
+            periodSeconds: 10
+          resources:
+            # No ffmpeg, no MediaMTX, no video passing through this
+            # process — it only makes small JSON calls to two vendor APIs
+            # and hands back a URL, so it needs a fraction of the old
+            # Go+MTX container's footprint.
+            requests:
+              cpu: 50m
+              memory: 64Mi
+            limits:
+              cpu: 250m
+              memory: 128Mi
+          securityContext:
+            runAsNonRoot: true
+            runAsUser: 10001
+      volumes:
+        - name: vendor-config
+          configMap:
+            name: vendors-config
+
+---
+# Same name and NodePort (30080) as the Go deployment's `backend` Service —
+# this apply replaces its selector/targetPort in place. Anything already
+# pointing at http://<node-ip>:30080/... keeps working unchanged.
+apiVersion: v1
+kind: Service
+metadata:
+  name: backend
+  namespace: bms-dev
+spec:
+  type: NodePort
+  selector:
+    app: bms-video
+  ports:
+    - port: 80
+      targetPort: 8080
+      nodePort: 30080
