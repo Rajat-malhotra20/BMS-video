@@ -396,6 +396,12 @@ def make_handler(app: App):
                         return self._handle_download_file(taskid, (qs.get("name") or [""])[0])
 
                 self._send_error("not found", 404)
+            except ConnectionError:  # BrokenPipe / Reset / Aborted
+                # Client left before we answered (tab closed, bus switched,
+                # proxy timeout). Nothing to send; trying to write an error
+                # to the same dead socket just raises again.
+                print(f"{self.command} {self.path}: client disconnected before response")
+                self.close_connection = True  # don't try to read another request off it
             except ValueError as e:
                 self._send_error(f"bad request: {e}", 400)
             except VendorError as e:
@@ -446,6 +452,12 @@ def make_handler(app: App):
                         return self._send_json({"taskId": taskid, "date": start[:10]})
 
                 self._send_error("not found", 404)
+            except ConnectionError:  # BrokenPipe / Reset / Aborted
+                # Client left before we answered (tab closed, bus switched,
+                # proxy timeout). Nothing to send; trying to write an error
+                # to the same dead socket just raises again.
+                print(f"{self.command} {self.path}: client disconnected before response")
+                self.close_connection = True  # don't try to read another request off it
             except ValueError as e:
                 self._send_error(f"bad request: {e}", 400)
             except VendorError as e:
