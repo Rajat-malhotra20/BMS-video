@@ -16,19 +16,27 @@ import time
 from domain import LiveSource, SourceKind, StreamRequest, VendorError
 from vendorclients import chemitoapi as rawclient
 
-# The account's real 16-channel ceiling (4 ports x 4 channels — the doc's
-# §4: "4-way video on one port and 16-way video at most at the same time").
-MAX_ACTIVE_CHANNELS = 16
+# Doc §7: "A port can configure up to 4 channels" / "4-way video on one port
+# and 16-way video at most". The account ceiling is therefore
+# len(live_ports) x 4, enforced per port — a 5th channel on a full port comes
+# back from the vendor as HTTP 408 or an instant EOF, indistinguishable from
+# a dead camera.
+PORT_CHANNEL_LIMIT = 4
 
-# Crash-safety backstop for a slot never explicitly released (e.g. this
-# process restarting mid-stream). Real release happens from
-# StreamService.stop_stream calling release() the moment a viewer stops.
-ACTIVE_SLOT_TTL = 30 * 60
+# Crash-safety backstop for a slot never explicitly released (tab closed
+# without stop-bus reaching us). The frontend re-resolves every live cam
+# every ~150s (VideoPlayer.tsx FLV_URL_MAX_AGE_MS), which renews the slot,
+# so anything silent for 5 minutes is gone.
+ACTIVE_SLOT_TTL = 5 * 60
 
 # Auth-error codes from Appendix 1 that a re-login can fix. Anything else
 # (device offline, no data) must not trigger one — a needless login
 # invalidates the key every other viewer is holding.
 AUTH_ERROR_CODES = {203, 204, 209, 210}
+
+# Record API's st is 1=main, 0=sub (live's is the reverse).
+RECORD_STREAM_MAIN = 1
+RECORD_STREAM_SUB = 0
 
 
 class Adapter:
@@ -40,35 +48,38 @@ class Adapter:
         self._key_lock = threading.Lock()
         self._key = ""
 
-        self._port_lock = threading.Lock()
-        self._port_by_channel = {}
-
         self._active_lock = threading.Lock()
-        self._active = {}  # channel_key -> last_renewed (monotonic)
+        self._active = {}  # slot_key ({bus}_{cam}) -> (last_renewed monotonic, port)
 
     def name(self) -> str:
         return "chemitoapi"
 
-    # ---- capacity slot (soft rate limit against the vendor's real ceiling) ----
+    # ---- port slots: least-loaded, sticky per channel, capped per port ----
 
-    def _acquire_slot(self, channel_key: str) -> None:
+    def _claim_port(self, slot_key: str, ports: list) -> int:
         with self._active_lock:
             now = time.monotonic()
-            for k, last in list(self._active.items()):
+            for k, (last, _) in list(self._active.items()):
                 if now - last > ACTIVE_SLOT_TTL:
                     del self._active[k]
 
-            if channel_key in self._active:
-                self._active[channel_key] = now
-                return
+            held = self._active.get(slot_key)
+            if held and held[1] in ports:
+                self._active[slot_key] = (now, held[1])  # renew, keep the same port
+                return held[1]
 
-            if len(self._active) >= MAX_ACTIVE_CHANNELS:
+            load = {p: 0 for p in ports}
+            for k, (_, p) in self._active.items():
+                if k != slot_key and p in load:
+                    load[p] += 1
+            best = min(ports, key=load.get)
+            if load[best] >= PORT_CHANNEL_LIMIT:
                 raise VendorError("chemitoapi", "resolve live video url", code="capacity_limit", retryable=True)
-
-            self._active[channel_key] = now
+            self._active[slot_key] = (now, best)
+            return best
 
     def release(self, channel_key: str) -> None:
-        """Frees channel_key's capacity slot immediately — called by
+        """Frees channel_key's port slot immediately — called by
         StreamService once a viewer explicitly stops. Safe for a key that
         never held a slot."""
         with self._active_lock:
@@ -77,22 +88,6 @@ class Adapter:
     def _active_count(self) -> int:
         with self._active_lock:
             return len(self._active)
-
-    # ---- port selection: least-loaded, sticky per channel ----
-
-    def _port_for(self, ports: list, channel_key: str) -> int:
-        with self._port_lock:
-            if channel_key in self._port_by_channel:
-                p = self._port_by_channel[channel_key]
-                if p in ports:
-                    return p  # still offered by the account — keep it stable
-
-            load = {}
-            for p in self._port_by_channel.values():
-                load[p] = load.get(p, 0) + 1
-            best = min(ports, key=lambda p: load.get(p, 0))
-            self._port_by_channel[channel_key] = best
-            return best
 
     # ---- shared login session ----
 
@@ -112,60 +107,56 @@ class Adapter:
                 raise VendorError("chemitoapi", "login", cause=e) from e
             return client
 
-    def _forget_key(self) -> None:
-        with self._key_lock:
-            self._key = ""
-
-    def _resolve_url(self, terid: str, channel: int, audio: bool, stream_type: int) -> str:
-        def attempt():
+    def _call(self, op: str, fn):
+        """Runs fn(client), re-logging in once if the vendor says the key is
+        dead. Every vendor failure comes out as a VendorError."""
+        for retry in (True, False):
             client = self._session()
             try:
-                ports = client.live_ports()
+                return fn(client)
+            except rawclient.APIError as e:
+                if retry and e.code in AUTH_ERROR_CODES:
+                    with self._key_lock:
+                        if self._key == client.key:  # another thread may have re-logged in already
+                            self._key = ""
+                    continue
+                raise VendorError("chemitoapi", op, cause=e) from e
+            except VendorError:
+                raise
             except Exception as e:
-                raise VendorError("chemitoapi", "list live ports", cause=e) from e
-            if not ports:
-                raise VendorError("chemitoapi", "resolve live source", code="no_live_ports", retryable=True)
+                raise VendorError("chemitoapi", op, cause=e) from e
 
-            print(f"chemitoapi: {terid}_{channel}: account offers {len(ports)} live port(s); "
-                  f"{self._active_count()} channel(s) currently held by this process")
-
-            port = self._port_for(ports, f"{terid}_{channel}")
-            try:
-                return client.live_video_url(terid, channel, audio, stream_type, port)
-            except Exception as e:
-                raise VendorError("chemitoapi", "resolve live video url", cause=e) from e
-
-        try:
-            return attempt()
-        except rawclient.APIError as e:
-            if e.code in AUTH_ERROR_CODES:
-                self._forget_key()
-                return attempt()
-            raise
+    # ---- §7 live ----
 
     def resolve_live_source(self, req: StreamRequest) -> LiveSource:
         terid = req.vendor_params.get("terid", "")
         channel = req.cam or 1
         stream_type = rawclient.LIVE_STREAM_MAIN if req.main else rawclient.LIVE_STREAM_SUB
 
-        # slotKey MUST be req.bus-based (not terid) — this is the exact
+        # slot_key MUST be req.bus-based (not terid) — this is the exact
         # string StreamService.stop_stream releases by, since it only ever
         # knows channels as {bus}_{cam}, never by terid.
         slot_key = f"{req.bus}_{channel}"
-        self._acquire_slot(slot_key)
 
-        url = self._resolve_url(terid, channel, req.audio, stream_type)
+        def fetch(client):
+            ports = client.live_ports()
+            if not ports:
+                raise VendorError("chemitoapi", "resolve live source", code="no_live_ports", retryable=True)
+            port = self._claim_port(slot_key, ports)
+            print(f"chemitoapi: {slot_key}: port {port} of {ports}; {self._active_count()} channel(s) held")
+            return client.live_video_url(terid, channel, req.audio, stream_type, port)
+
+        try:
+            url = self._call("resolve live video url", fetch)
+        except Exception:
+            self.release(slot_key)  # a failed resolve must not sit on a port
+            raise
         return LiveSource(kind=SourceKind.FLV, url=url, has_audio=True)
 
     def list_cameras(self, vendor_params: dict) -> list:
         from domain import Camera
 
-        client = self._session()
-        try:
-            devices = client.list_devices()
-        except Exception as e:
-            raise VendorError("chemitoapi", "list devices", cause=e) from e
-
+        devices = self._call("list devices", lambda c: c.list_devices())
         cams = []
         for d in devices:
             vendor_id = d.get("carlicence") or d.get("terid", "")
@@ -176,3 +167,47 @@ class Adapter:
                 channels=d.get("channelcount", 0),
             ))
         return cams
+
+    # ---- §8 history playback ----
+
+    def record_files(self, vendor_params: dict, start: str, end: str, cams: list) -> list:
+        terid = vendor_params.get("terid", "")
+        rows = self._call("record file list",
+                          lambda c: c.record_files(terid, start, end, cams, RECORD_STREAM_MAIN))
+        return [{"cam": r.get("chn"), "start": r.get("starttime"), "end": r.get("endtime"),
+                 "alarm": r.get("filetype") == 2} for r in rows]
+
+    def playback(self, vendor_params: dict, cam: int, start: str, main: bool = True) -> dict:
+        terid = vendor_params.get("terid", "")
+        st = RECORD_STREAM_MAIN if main else RECORD_STREAM_SUB
+        url, sn = self._call("record flv video", lambda c: c.record_flv(terid, start, cam, st))
+        if not url:
+            raise VendorError("chemitoapi", "record flv video", code="no_recording")
+        return {"cam": cam, "kind": SourceKind.FLV, "directUrl": url, "sn": sn}
+
+    def playback_control(self, action: str, sn: str, start: str = "") -> None:
+        self._call(f"flv {action}", lambda c: c.flv_control(action, sn, start))
+
+    # ---- §9 download ----
+
+    def add_download(self, vendor_params: dict, name: str, start: str, end: str, cams: list, main: bool = True) -> int:
+        terid = vendor_params.get("terid", "")
+        st = 1 if main else 0  # task API: 1 main (default), 0 sub
+        return self._call("add download task",
+                          lambda c: c.add_download_task(terid, start, end, cams, name, st))
+
+    def download_state(self, taskid: int, date: str) -> dict:
+        return self._call("download task state", lambda c: c.download_task_state(taskid, date))
+
+    def download_files(self, taskid: int) -> list:
+        return self._call("download task files", lambda c: c.download_task_files(taskid))
+
+    def open_download(self, taskid: int, name: str):
+        """Opens one finished task file by name. dir comes from the vendor's
+        own file list, never from the caller — the vendor would happily
+        serve any path the account can read."""
+        files = self.download_files(taskid)
+        match = next((f for f in files if f.get("name") == name), None)
+        if match is None:
+            raise VendorError("chemitoapi", "download file", code="no_file")
+        return self._call("download file", lambda c: c.open_download(match["dir"], name))

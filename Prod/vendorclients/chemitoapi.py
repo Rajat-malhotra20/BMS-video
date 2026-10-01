@@ -1,7 +1,8 @@
 """Go client for Chemito's "CM Server Application" HTTP API
 (docs/vendors/chemito/PMIDTC_CIPLAPIS.xlsx). Ported from
-prototype/backend/vendorclients/chemitoapi/client.go. Only the live-video
-path is implemented — GPS/alarm interfaces are documented but unused.
+prototype/backend/vendorclients/chemitoapi/client.go. Live video (§7),
+history video (§8) and video download (§9) are implemented — GPS/alarm
+interfaces are documented but unused. Live API help: <base>/help/api/default.html.
 """
 
 import json
@@ -70,7 +71,19 @@ class Client:
         self.timeout = timeout
         self.key = ""
 
-    def _do(self, url: str, method: str = "GET", body: bytes = None, headers: dict = None) -> dict:
+    def _do(self, url: str, method: str = "GET", body: bytes = None, headers: dict = None):
+        return self._env(url, method, body, headers).get("data")
+
+    def _post(self, path: str, payload: dict) -> dict:
+        """JSON POST with the key in the body (every POST in §8/§9 takes it there)."""
+        body = json.dumps({"key": self.key, **payload}).encode()
+        return self._env(f"{self.base_url}{path}", "POST", body, {"Content-Type": "application/json"})
+
+    def _get(self, path: str, params: dict):
+        q = urllib.parse.urlencode({"key": self.key, **params})
+        return self._do(f"{self.base_url}{path}?{q}")
+
+    def _env(self, url: str, method: str = "GET", body: bytes = None, headers: dict = None) -> dict:
         req = urllib.request.Request(url, data=body, method=method, headers=headers or {})
         try:
             with urllib.request.urlopen(req, timeout=self.timeout) as resp:
@@ -88,7 +101,7 @@ class Client:
         code = env.get("errorcode", 0)
         if code != 200 and code != 0:
             raise APIError(code)
-        return env.get("data")
+        return env
 
     def login(self, username: str, password: str) -> str:
         """POST /api/v1/basic/key — body {"username","password"}."""
@@ -146,3 +159,59 @@ class Client:
         })
         data = self._do(f"{self.base_url}/api/v1/basic/live/video?{q}")
         return (data or {}).get("url", "")
+
+    # ---- §8 history video (times are "YYYY-MM-DD HH:MM:SS"; st here is 1=main, 0=sub — the reverse of live) ----
+
+    def record_files(self, terid: str, start: str, end: str, channels: list, stream_type: int) -> list:
+        """GET /api/v1/basic/record/filelist — recorded segments on the device."""
+        return self._get("/api/v1/basic/record/filelist", {
+            "terid": terid, "starttime": start, "endtime": end,
+            "chl": ",".join(str(c) for c in channels), "st": stream_type, "pbt": 0,
+        }) or []
+
+    def record_flv(self, terid: str, start: str, channel: int, stream_type: int) -> tuple:
+        """GET /api/v1/basic/record/flv/video — device playback as HTTP-FLV
+        starting at `start`. Returns (url, sn); sn drives pause/resume/seek/stop."""
+        env = self._env(f"{self.base_url}/api/v1/basic/record/flv/video?" + urllib.parse.urlencode({
+            "key": self.key, "terid": terid, "starttime": start, "chl": channel, "st": stream_type,
+        }))
+        data = env.get("data") or []
+        url = (data[0] if isinstance(data, list) and data else data or {}).get("url", "")
+        return url, env.get("sn", "")
+
+    def flv_control(self, action: str, sn: str, start: str = "") -> None:
+        """POST /api/v1/basic/flv/{pause,resume,seek,stop}."""
+        payload = {"sn": sn}
+        if action == "seek":
+            payload["starttime"] = start
+        self._post(f"/api/v1/basic/flv/{action}", payload)
+
+    # ---- §9 video download (server pulls the recording off the device, then serves the file) ----
+
+    def add_download_task(self, terid: str, start: str, end: str, channels: list, name: str, stream_type: int) -> int:
+        """POST /api/v1/basic/record/task — tasktype 1 = video recording,
+        netmode 7 = any network, kept 7 days."""
+        env = self._post("/api/v1/basic/record/task", {
+            "terid": terid, "starttime": start, "endtime": end, "chl": channels,
+            "name": name[:15], "effective": 7, "netmode": 7, "tasktype": 1, "stream": stream_type,
+        })
+        return (env.get("data") or {}).get("taskid")
+
+    def download_task_state(self, taskid: int, date: str) -> dict:
+        """POST /api/v1/basic/record/taskstate — {percent, state, taskid}; state 3 = completed."""
+        env = self._post("/api/v1/basic/record/taskstate", {"parms": [{"taskid": taskid, "date": date}]})
+        rows = env.get("data") or []
+        return rows[0] if rows else {}
+
+    def download_task_files(self, taskid: int) -> list:
+        """GET /api/v1/basic/record/taskfilelist — [{dir (base64), name}]."""
+        return self._get("/api/v1/basic/record/taskfilelist", {"taskid": taskid, "tasktype": 1}) or []
+
+    def open_download(self, dir_b64: str, name: str):
+        """GET /api/v1/basic/record/download — raw file bytes. Returns the open
+        response; caller streams it and closes it."""
+        q = urllib.parse.urlencode({"key": self.key, "dir": dir_b64, "name": name})
+        try:
+            return urllib.request.urlopen(f"{self.base_url}/api/v1/basic/record/download?{q}", timeout=self.timeout)
+        except urllib.error.URLError as e:
+            raise RuntimeError(f"chemitoapi: download failed: {e}") from e

@@ -52,6 +52,10 @@ def run_startup_auto_start(stream: StreamService, buses: dict):
     for entry in stream.vendor_roster():
         bus_id = entry.key.removesuffix("_1")
         seen.add(bus_id)
+        if entry.vendor == "chemitoapi":
+            # Its live URL dies in ~180s and each resolve claims a port slot,
+            # so pre-resolving at boot only blocks the first real viewer.
+            continue
         n = entry.channels or STARTUP_AUTO_START_CHANNELS_PER_BUS
         n = min(n, STARTUP_AUTO_START_CHANNELS_PER_BUS)
         t = threading.Thread(target=start_bus_channels, args=(bus_id, entry.vendor, entry.vendor_params, n), daemon=True)
@@ -61,7 +65,7 @@ def run_startup_auto_start(stream: StreamService, buses: dict):
     # buses.json is only a fallback, for vendors that can't be listed —
     # anything the roster already found is skipped.
     for bus_id, cfg in buses.items():
-        if bus_id in seen:
+        if bus_id in seen or cfg.vendor == "chemitoapi":
             continue
         t = threading.Thread(target=start_bus_channels, args=(bus_id, cfg.vendor, cfg.vendor_params, STARTUP_AUTO_START_CHANNELS_PER_BUS), daemon=True)
         t.start()

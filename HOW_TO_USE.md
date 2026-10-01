@@ -216,6 +216,66 @@ it (destroy the player). `/api/bridge/stop` still works for real for
 | `404` (bare bus, no `?cam=`) | The bus isn't known to any vendor account | Check the bus id |
 | *(cam omitted from the array)* | For a bare `GET /api/stream/{id}` (no `?cam=`), a single bad channel is silently dropped rather than failing the whole request | Treat a missing cam number as unavailable, not an error |
 
+## 4. Recordings: watch from a timestamp, download (Chemito buses)
+
+Pulled from the vendor's own API (Chemito doc §8/§9), not from a media
+server. Times are `YYYY-MM-DD HH:MM:SS` in the **device's local time**, URL-
+encoded (space → `%20`). Bad time → `400`. Non-Chemito bus → `501`.
+
+**Watch from a timestamp**
+
+```
+GET  /api/playback/{busId}/files?start=2026-09-30 10:00:00&end=2026-09-30 12:00:00&cam=1,2
+     → [{ "cam": 1, "start": "...", "end": "...", "alarm": false }]       what exists on the device
+GET  /api/playback/{busId}?cam=2&start=2026-09-30 10:15:00   (&sub=1 for sub-stream)
+     → { "cam": 2, "kind": "flv", "directUrl": "...", "sn": "..." }
+POST /api/playback/control?action=pause|resume|stop&sn=...
+POST /api/playback/control?action=seek&sn=...&start=2026-09-30 10:40:00
+```
+
+Play `directUrl` exactly like live `kind: "flv"`. **Always `action=stop` with
+the `sn` when the player closes** — playback pulls video off the bus over 4G
+and keeps going until stopped.
+
+**Download**
+
+```
+POST /api/download/{busId}?cam=1,2&start=2026-09-30 10:00:00&end=2026-09-30 10:10:00
+     → { "taskId": 12, "date": "2026-09-30" }
+GET  /api/download/task/12?date=2026-09-30          poll every ~5s
+     → { "state": 1, "percent": 40, "done": false, "files": [] }
+     → { "state": 3, "percent": 100, "done": true,
+         "files": [{ "name": "...mp4", "url": "/api/download/task/12/file?name=...mp4" }] }
+GET  {url}&token=...                                 the file (attachment); use a plain <a href>
+```
+
+The server first copies the clip off the bus, so it takes minutes, not
+seconds. Keep windows short. `state` values: `-1` waiting, `1` downloading,
+`2` no video for that window, `3` done, `4`/`6` failed, `8` expired (tasks are
+kept 7 days). Prefer `.mp4` files; `.264` is raw H.264.
+
+**Panic button: playback from 10s before the press (nothing saved)**
+
+Call this from whatever raises the panic alarm, the moment it does:
+
+```
+POST /api/panic/{busId}?time=2026-10-01 09:00:05[&cam=1,2]   time of the press, bus local time; default every camera
+     → { "bus": "...", "time": "...", "start": "...08:59:55", "end": "...09:00:15",
+         "cams": [{ "cam": 1, "kind": "flv", "directUrl": "...", "sn": "..." }],
+         "errors": { "2": "why cam 2 couldn't start" } }
+```
+
+- Play each `directUrl` like any `kind: "flv"`. It runs in real time from
+  press −10s, so it reaches press +10s 20 seconds in.
+- Safe to call more than once: the alarm system, every open browser and a
+  repeated press within 10s on the same bus all get the **same** sessions.
+- The server stops the sessions itself after 2 minutes so an unwatched alarm
+  doesn't keep the bus streaming over 4G. Calling again after that starts a
+  fresh replay.
+- `404` = no recording on any camera for that time (or unknown bus).
+- The frontend's panic banner has a **Watch −10s / +10s** button that calls
+  this same endpoint.
+
 ## Endpoints that are not available
 
 These are **not routed** in this deployment and return `404`. They are not
@@ -225,7 +285,7 @@ do not treat the `404` as an outage.
 
 | Route | Was for | Why it is gone |
 |---|---|---|
-| `GET /api/stream/{id}/recording` | mp4 clips of a past window | needs the media server to have recorded it |
+| `GET /api/stream/{id}/recording` | mp4 clips of a past window | needs the media server to have recorded it — use §4 instead |
 | `GET /api/bridge` | listing active remux jobs | no remux jobs can exist |
 | `/api/flv/{key}` | this server proxying FLV bytes | removed — `kind: "flv"` now hands back the vendor's own URL directly instead |
 | `/live/...` | HLS playback of a relayed stream | proxy to a media server that is not running |
@@ -255,7 +315,8 @@ the old byte-proxying behavior back.
 | Stop a camera | `POST /api/bridge/stop?key={busId}_{cam}` — no-op for `kind: "flv"`, real for `embed`/`hls`/RTSP |
 | Check the server is alive | `GET /health` |
 | See which endpoints actually exist | `GET /` |
-| Watch a past moment | **not available** — no recording in this deployment |
+| Watch a past moment | `GET /api/playback/{busId}?cam=N&start=...` (Chemito buses, see §4) |
+| Download a clip | `POST /api/download/{busId}?...` → poll `GET /api/download/task/{id}` (see §4) |
 
 ## Things to know
 
