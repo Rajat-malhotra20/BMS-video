@@ -83,20 +83,21 @@ class App:
             return cfg.vendor, cfg.vendor_params
         return self.stream.roster_vendor(bus)
 
-    def ensure_stream(self, bus: str, cam: int):
-        """What GET /api/stream/{id}?cam=N calls when that bus+cam isn't
-        already active. Returns None when the bus isn't configured for
-        bridging at all, or when it's already active (caller keeps the
-        existing entry)."""
+    def ensure_stream(self, bus: str, cam: int, main: bool = True):
+        """What GET /api/stream/{id} calls for a cam that isn't already
+        active at this quality. Returns None when the bus isn't configured
+        for bridging at all, or when it's already active at the same
+        quality (caller keeps the existing entry)."""
         key = f"{bus}_{cam}"
-        if self.stream.is_active(key):
+        e = self.stream.direct_entry_for(key)
+        if e is not None and e.main == main:
             return None
         vendor, params = self.vendor_for(bus)
         if vendor is None:
             return None
-        return self.stream.start_stream(StreamRequest(bus=bus, cam=cam, vendor=vendor, main=True, audio=True, vendor_params=params or {}))
+        return self.stream.start_stream(StreamRequest(bus=bus, cam=cam, vendor=vendor, main=main, audio=main, vendor_params=params or {}))
 
-    def refresh_stream(self, bus: str, cam: int):
+    def refresh_stream(self, bus: str, cam: int, main: bool = True):
         """What GET /api/stream/{id}?cam=N calls — unlike ensure_stream,
         this ALWAYS re-resolves against the vendor, even if the cam is
         already active. It exists for the frontend's stale-URL watcher
@@ -108,7 +109,7 @@ class App:
         vendor, params = self.vendor_for(bus)
         if vendor is None:
             return None
-        return self.stream.start_stream(StreamRequest(bus=bus, cam=cam, vendor=vendor, main=True, audio=True, vendor_params=params or {}))
+        return self.stream.start_stream(StreamRequest(bus=bus, cam=cam, vendor=vendor, main=main, audio=main, vendor_params=params or {}))
 
     # ---- fleet ----
 
@@ -149,7 +150,7 @@ class App:
                 stopped.append(e.key)
         return stopped
 
-    def ensure_all_cams(self, bus: str, have: list) -> list:
+    def ensure_all_cams(self, bus: str, have: list, main: bool = True) -> list:
         """Brings up every channel of bus not live yet. A channel that fails
         to start is skipped, never fatal — one dead camera must not blank
         the others."""
@@ -163,7 +164,7 @@ class App:
 
         def start_one(cam):
             try:
-                result = self.ensure_stream(bus, cam)
+                result = self.ensure_stream(bus, cam, main)
             except Exception as e:
                 print(f"stream live: {bus}_{cam}: {e}")
                 return None
@@ -308,7 +309,10 @@ def make_handler(app: App):
         server_version = "fleet-bms-prod/1.0"
 
         def log_message(self, fmt, *args):
-            print(f"{self.command} {self.path} - {fmt % args}")
+            # command/path are unset when the request line itself is garbage
+            # (a TLS handshake or port scan hitting this plain-HTTP port) -
+            # the stdlib still logs its 400 through here.
+            print(f"{getattr(self, 'command', None) or '-'} {getattr(self, 'path', '-')} - {fmt % args}")
 
         # ---- plumbing ----
 
@@ -502,6 +506,9 @@ def make_handler(app: App):
 
         def _handle_stream_live(self, bus_id, qs):
             cam_filter = (qs.get("cam") or [""])[0]
+            # sub=1: the vendor's low-bitrate sub-stream, no audio - what grid
+            # tiles ask for. Fullscreen omits it and gets main + audio.
+            main = (qs.get("sub") or [""])[0] != "1"
 
             if cam_filter:
                 # A specific cam is an explicit ask for a CURRENT url, not
@@ -510,14 +517,14 @@ def make_handler(app: App):
                 # App.refresh_stream's docstring for why serving the cached
                 # entry here would defeat the point of that watcher.
                 want_cam = int(cam_filter)
-                result = app.refresh_stream(bus_id, want_cam)
+                result = app.refresh_stream(bus_id, want_cam, main)
                 if result is None:
                     return self._send_error(f'bus "{bus_id}" is not configured for bridging', 404)
                 have = [{"cam": want_cam, "path": result.key, "ready": True,
                          "kind": result.kind, "directUrl": result.embed_url or result.url}]
             else:
-                have = [app.stream_info(cam, e) for cam, e in app.cams_for_bus(bus_id)]
-                have = app.ensure_all_cams(bus_id, have)
+                have = [app.stream_info(cam, e) for cam, e in app.cams_for_bus(bus_id) if e.main == main]
+                have = app.ensure_all_cams(bus_id, have, main)
 
             self._send_json(have)
 

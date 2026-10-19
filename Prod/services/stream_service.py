@@ -38,6 +38,7 @@ class DirectEntry:
     embed_url: str = ""
     url: str = ""
     has_audio: bool = False
+    main: bool = True  # main stream vs sub-stream - GET /api/stream?sub=1 only reuses a matching one
 
 
 class StreamService:
@@ -131,7 +132,7 @@ class StreamService:
         # so a later GET /api/stream/{id} skips re-triggering the vendor.
         with self._direct_lock:
             self._direct_active[key] = DirectEntry(
-                key=key, kind=src.kind, url=src.url, has_audio=src.has_audio,
+                key=key, kind=src.kind, url=src.url, has_audio=src.has_audio, main=req.main,
             )
         return StreamResult(key=key, kind=src.kind, url=src.url)
 

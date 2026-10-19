@@ -311,6 +311,7 @@ the old byte-proxying behavior back.
 | See all buses, live-updating (no polling) | `GET /api/fleet/stream` |
 | See one bus's cameras in detail | `GET /api/bus/{busId}` |
 | Watch one specific camera live (starts it if needed, re-resolves every call for FLV) | `GET /api/stream/{busId}?cam=2` |
+| Low-bitrate grid view (Chemito sub-stream, no audio) | add `sub=1` to either call above, e.g. `GET /api/stream/{busId}?sub=1` |
 | Play what that returned | `kind: "flv"` → mpegts.js, `directUrl` used as-is · `kind: "hls"` → hls.js · `kind: "embed"` → `<iframe>` |
 | Stop a camera | `POST /api/bridge/stop?key={busId}_{cam}` — no-op for `kind: "flv"`, real for `embed`/`hls`/RTSP |
 | Check the server is alive | `GET /health` |

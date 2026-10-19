@@ -78,5 +78,33 @@ def demo():
     print("ok")
 
 
+def demo_sub_main():
+    """Grid asks sub, fullscreen asks main: neither may be served the other's cached URL."""
+    import api
+    from domain import LiveSource
+    from services.stream_service import StreamService
+    from vendors.registry import Registry
+
+    class Cam:
+        vendor_id, label, online, channels, vendor_params = "BUS1", "BUS1", True, 2, {"terid": "T1"}
+
+    class V:
+        calls = []
+        def name(self): return "chemitoapi"
+        def list_cameras(self, _): return [Cam()]
+        def resolve_live_source(self, req):
+            V.calls.append((req.cam, req.main, req.audio))
+            return LiveSource(kind="flv", url=f"u{req.cam}{'m' if req.main else 's'}")
+
+    app = api.App(StreamService(Registry(V())), {}, "", "*")
+    grid = app.ensure_all_cams("BUS1", [], main=False)
+    assert [g["directUrl"] for g in grid] == ["u1s", "u2s"] and V.calls == [(1, False, False), (2, False, False)]
+    assert app.ensure_all_cams("BUS1", [i for i in grid], main=False) == grid and len(V.calls) == 2  # cached
+    assert app.refresh_stream("BUS1", 1, main=True).url == "u1m" and V.calls[-1] == (1, True, True)
+    assert app.ensure_stream("BUS1", 1, main=False).url == "u1s"  # cache now holds main -> re-resolve sub
+    print("ok sub/main")
+
+
 if __name__ == "__main__":
     demo()
+    demo_sub_main()
