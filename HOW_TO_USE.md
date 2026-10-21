@@ -254,24 +254,29 @@ seconds. Keep windows short. `state` values: `-1` waiting, `1` downloading,
 `2` no video for that window, `3` done, `4`/`6` failed, `8` expired (tasks are
 kept 7 days). Prefer `.mp4` files; `.264` is raw H.264.
 
-**Panic button: playback from 10s before the press (nothing saved)**
+**Panic button: playback of a given window (nothing saved)**
 
-Call this from whatever raises the panic alarm, the moment it does:
+The frontend sends the bus and the time range to play; only that window is
+played:
 
 ```
-POST /api/panic/{busId}?time=2026-10-01 09:00:05[&cam=1,2]   time of the press, bus local time; default every camera
-     → { "bus": "...", "time": "...", "start": "...08:59:55", "end": "...09:00:15",
+POST /api/panic/{busId}?start=2026-10-01 09:00:00&end=2026-10-01 09:02:00[&cam=1,2]
+POST /api/panic/{busId}?time=2026-10-01 09:00:05[&cam=1,2]     shortcut: window = press −10s..+10s
+     → { "bus": "...", "time": "..." | null, "start": "...", "end": "...",
          "cams": [{ "cam": 1, "kind": "flv", "directUrl": "...", "sn": "..." }],
          "errors": { "2": "why cam 2 couldn't start" } }
 ```
 
+- Times are bus local time, `YYYY-MM-DD HH:MM:SS` (space as `%20`). Default
+  is every camera. `end` must be after `start` (else `400`).
 - Play each `directUrl` like any `kind: "flv"`. It runs in real time from
-  press −10s, so it reaches press +10s 20 seconds in.
-- Safe to call more than once: the alarm system, every open browser and a
-  repeated press within 10s on the same bus all get the **same** sessions.
-- The server stops the sessions itself after 2 minutes so an unwatched alarm
-  doesn't keep the bus streaming over 4G. Calling again after that starts a
-  fresh replay.
+  `start`, so it reaches `end` (end − start) seconds in.
+- Safe to call more than once: calls for the same bus whose start and end are
+  each within 10s of an open window (the alarm system, every open browser, a
+  repeated press) all get the **same** sessions.
+- The server stops the sessions itself once the window has played, plus ~100s
+  slack for a slow first frame, so nothing past `end` keeps the bus streaming
+  over 4G. Calling again after that starts a fresh replay.
 - `404` = no recording on any camera for that time (or unknown bus).
 - The frontend's panic banner has a **Watch −10s / +10s** button that calls
   this same endpoint.

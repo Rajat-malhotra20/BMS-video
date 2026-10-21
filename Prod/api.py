@@ -15,7 +15,8 @@ Recordings (Chemito doc §8/§9, times "YYYY-MM-DD HH:MM:SS" device-local):
     POST /api/download/{bus}?cam=1,2&start&end[&sub=1] -> {taskId, date}
     GET  /api/download/task/{taskId}?date              -> {state, percent, done, files[{name,url}]}
     GET  /api/download/task/{taskId}/file?name         file bytes (proxied, vendor key stays server-side)
-    POST /api/panic/{bus}?time[&cam=1,2]               playback of every cam from press-10s (idempotent)
+    POST /api/panic/{bus}?start&end[&cam=1,2]          playback of every cam for that window (idempotent)
+    POST /api/panic/{bus}?time[&cam=1,2]               same, window = press -10s..+10s
 
 Everything else the Go API exposed — bus detail, bridge start, the
 sumithlive debug routes, the "/" listing — is dropped on purpose; the
@@ -50,12 +51,13 @@ CAMS_PER_BUS_FALLBACK = 4
 # which bus asks.
 CAMS_PER_BUS_CEILING = 16
 
-# Panic button window around the press, and how long its playback sessions
-# stay open: the 20s window plus slack for a slow first frame (cams have
-# been measured at up to ~75s, see VideoPlayer.tsx).
+# Panic button window around the press (when only ?time is given), and how
+# long its playback sessions stay open past the window's own length: slack
+# for a slow first frame (cams have been measured at up to ~75s, see
+# VideoPlayer.tsx).
 PANIC_BEFORE = 10
 PANIC_AFTER = 10
-PANIC_PLAY_SECONDS = 120
+PANIC_PLAY_SLACK = 100
 
 
 class App:
@@ -197,37 +199,40 @@ class App:
     def chemito(self):
         return self.stream.registry.get("chemitoapi")
 
-    # ---- panic playback: from press -PANIC_BEFORE, nothing saved ----
+    # ---- panic playback: a given window, nothing saved ----
 
-    def panic_playback(self, bus: str, alarm_time: str, cams: list = None) -> dict:
-        """Starts device playback of every camera (or `cams`) from
-        PANIC_BEFORE seconds before the press. Playback runs in real time, so
-        it reaches press+PANIC_AFTER 20s after it starts — by then the bus
-        has recorded it; no waiting needed.
+    def panic_playback(self, bus: str, start: str, end: str, cams: list = None, alarm_time: str = None) -> dict:
+        """Starts device playback of every camera (or `cams`) from `start`.
+        Playback runs in real time, so it reaches `end` (end - start) seconds
+        after it starts; the sessions are stopped then, plus
+        PANIC_PLAY_SLACK for a slow first frame, so nothing past the window
+        keeps the bus streaming over 4G.
 
         Idempotent while the sessions are open: the alarm system, every open
-        browser and a driver pressing again within PANIC_AFTER all get the
-        same sessions. They're stopped after PANIC_PLAY_SECONDS so an
-        unwatched alarm doesn't keep the bus streaming over 4G; a call after
-        that starts fresh ones (a replay)."""
-        t = datetime.strptime(alarm_time, TIME_FORMAT)
+        browser and a driver pressing again within PANIC_AFTER (start and end
+        each within that of an open window on the same bus) all get the same
+        sessions. A call after they're stopped starts fresh ones (a replay)."""
+        s = datetime.strptime(start, TIME_FORMAT)
+        e = datetime.strptime(end, TIME_FORMAT)
+        if e <= s:
+            raise ValueError("end must be after start")
         adapter, params = self.recording_adapter(bus)
+        play_seconds = (e - s).total_seconds() + PANIC_PLAY_SLACK
         with self._panic_lock:
             now = time.monotonic()
             self._panic = {k: v for k, v in self._panic.items() if v["_expires"] > now}
-            for (b, et), existing in self._panic.items():
-                if b == bus and abs((t - et).total_seconds()) <= PANIC_AFTER:
+            for (b, es, ee), existing in self._panic.items():
+                if (b == bus and abs((s - es).total_seconds()) <= PANIC_AFTER
+                        and abs((e - ee).total_seconds()) <= PANIC_AFTER):
                     break
             else:
                 existing = None
                 entry = {
-                    "bus": bus, "time": alarm_time,
-                    "start": (t - timedelta(seconds=PANIC_BEFORE)).strftime(TIME_FORMAT),
-                    "end": (t + timedelta(seconds=PANIC_AFTER)).strftime(TIME_FORMAT),
+                    "bus": bus, "time": alarm_time, "start": start, "end": end,
                     "cams": [], "errors": {},
-                    "_expires": now + PANIC_PLAY_SECONDS, "_ready": threading.Event(),
+                    "_expires": now + play_seconds, "_ready": threading.Event(),
                 }
-                self._panic[(bus, t)] = entry
+                self._panic[(bus, s, e)] = entry
         if existing is not None:
             existing["_ready"].wait(30)  # a concurrent first call may still be opening sessions
             return existing
@@ -238,7 +243,7 @@ class App:
 
         def open_one(cam):
             try:
-                return adapter.playback(params, cam, entry["start"])
+                return adapter.playback(params, cam, start)
             except Exception as e:
                 entry["errors"][cam] = str(e)
                 return None
@@ -251,8 +256,8 @@ class App:
 
         if not entry["cams"]:
             with self._panic_lock:
-                self._panic.pop((bus, t), None)
-            raise VendorError("chemitoapi", f"panic playback {bus} @ {alarm_time}: {entry['errors']}",
+                self._panic.pop((bus, s, e), None)
+            raise VendorError("chemitoapi", f"panic playback {bus} {start}..{end}: {entry['errors']}",
                               code="no_recording")
 
         def stop_all():
@@ -263,7 +268,7 @@ class App:
                     print(f"panic playback stop {bus} cam {p['cam']}: {e}")
 
         # ponytail: in-memory timer — a restart before it fires leaves those sessions to the vendor's own timeout.
-        threading.Timer(PANIC_PLAY_SECONDS, stop_all).start()
+        threading.Timer(play_seconds, stop_all).start()
         return entry
 
 
@@ -443,7 +448,14 @@ def make_handler(app: App):
                     bus_id = path[len("/api/panic/"):]
                     if bus_id and "/" not in bus_id:
                         cams = parse_cams(qs, "") if qs.get("cam") else None
-                        entry = app.panic_playback(bus_id, parse_time(qs, "time"), cams)
+                        if qs.get("start") or qs.get("end"):
+                            entry = app.panic_playback(bus_id, parse_time(qs, "start"), parse_time(qs, "end"), cams)
+                        else:
+                            alarm = parse_time(qs, "time")
+                            t = datetime.strptime(alarm, TIME_FORMAT)
+                            entry = app.panic_playback(
+                                bus_id, (t - timedelta(seconds=PANIC_BEFORE)).strftime(TIME_FORMAT),
+                                (t + timedelta(seconds=PANIC_AFTER)).strftime(TIME_FORMAT), cams, alarm_time=alarm)
                         return self._send_json({k: v for k, v in entry.items() if not k.startswith("_")})
 
                 if path.startswith("/api/download/"):
