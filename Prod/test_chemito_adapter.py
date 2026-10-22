@@ -34,6 +34,12 @@ class FakeClient:
         return f"https://gw:{port}/live.flv?devid={terid}&chl={chl}"
 
 
+def expire_cooling(a):
+    """Pretends VENDOR_LINGER has passed for every released slot."""
+    for k, (t, p) in list(a._cooling.items()):
+        a._cooling[k] = (t - mod.VENDOR_LINGER - 1, p)
+
+
 def req(bus, cam):
     return StreamRequest(bus=bus, vendor="chemitoapi", cam=cam, vendor_params={"terid": bus})
 
@@ -55,20 +61,34 @@ def demo():
     # Re-resolving a held channel keeps its port and doesn't need a free one.
     assert a.resolve_live_source(req("B0", 1)).url == urls[0]
 
-    # Releasing one bus frees its slots for the next bus.
+    # A released bus keeps its slots while the vendor still holds them...
     for c in range(1, 5):
         a.release(f"B0_{c}")
+    try:
+        a.resolve_live_source(req("B9", 1))
+        raise AssertionError("cooling slots must still count")
+    except VendorError as e:
+        assert e.code == "capacity_limit"
+    # ...but going back to that same bus reuses them, on the same ports.
+    assert a.resolve_live_source(req("B0", 2)).url == urls[1]
+    a.release("B0_2")
+
+    # Once the vendor has let go, the next bus gets them.
+    expire_cooling(a)
     assert all(a.resolve_live_source(req("B9", c)).url for c in range(1, 5))
 
-    # A failed resolve doesn't keep a slot.
+    # A failed resolve doesn't keep a slot, not even a cooling one.
     for c in range(1, 5):
         a.release(f"B9_{c}")
+    expire_cooling(a)
     FakeClient.fail_terid = "BAD"
     try:
         a.resolve_live_source(req("BAD", 1))
-    except VendorError:
-        pass
-    assert "BAD_1" not in a._active
+        raise AssertionError("expected vendor error")
+    except VendorError as e:
+        assert e.code != "capacity_limit"
+    assert "BAD_1" not in a._active and "BAD_1" not in a._cooling
+    FakeClient.fail_terid = None
 
     # Expired key -> exactly one re-login, then success.
     FakeClient.dead_keys.add(a._key)
@@ -97,14 +117,45 @@ def demo_sub_main():
             return LiveSource(kind="flv", url=f"u{req.cam}{'m' if req.main else 's'}")
 
     app = api.App(StreamService(Registry(V())), {}, "", "*")
-    grid = app.ensure_all_cams("BUS1", [], main=False)
+    grid = app.ensure_all_cams("BUS1", main=False)
     assert [g["directUrl"] for g in grid] == ["u1s", "u2s"] and V.calls == [(1, False, False), (2, False, False)]
-    assert app.ensure_all_cams("BUS1", [i for i in grid], main=False) == grid and len(V.calls) == 2  # cached
+    # Vendor URLs are single-use: asking again re-resolves, never serves a stored one.
+    assert app.ensure_all_cams("BUS1", main=False) == grid and len(V.calls) == 4
     assert app.refresh_stream("BUS1", 1, main=True).url == "u1m" and V.calls[-1] == (1, True, True)
-    assert app.ensure_stream("BUS1", 1, main=False).url == "u1s"  # cache now holds main -> re-resolve sub
     print("ok sub/main")
+
+
+def demo_bus_busy():
+    """Every cam refused for capacity -> 503, not an empty 200; one cam up -> 200."""
+    import api
+    from services.stream_service import StreamService
+    from vendors.registry import Registry
+
+    class Cam:
+        vendor_id, label, online, channels, vendor_params = "BUS1", "BUS1", True, 3, {"terid": "T1"}
+
+    class V:
+        refuse = {1, 2, 3}
+        def name(self): return "chemitoapi"
+        def list_cameras(self, _): return [Cam()]
+        def resolve_live_source(self, req):
+            if req.cam in V.refuse:
+                raise VendorError("chemitoapi", "resolve live video url", code="capacity_limit")
+            return LiveSource(kind="flv", url=f"u{req.cam}")
+
+    from domain import LiveSource
+    app = api.App(StreamService(Registry(V())), {}, "", "*")
+    try:
+        app.ensure_all_cams("BUS1", main=False)
+        raise AssertionError("expected capacity_limit")
+    except VendorError as e:
+        assert e.code == "capacity_limit" and api.error_status(e) == 503
+    V.refuse = {2, 3}
+    assert [g["cam"] for g in app.ensure_all_cams("BUS1", main=False)] == [1]
+    print("ok busy")
 
 
 if __name__ == "__main__":
     demo()
     demo_sub_main()
+    demo_bus_busy()

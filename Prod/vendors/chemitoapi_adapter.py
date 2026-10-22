@@ -29,6 +29,14 @@ PORT_CHANNEL_LIMIT = 4
 # so anything silent for 5 minutes is gone.
 ACTIVE_SLOT_TTL = 5 * 60
 
+# Chemito has no "close live stream" call and keeps a channel busy for a
+# while after the viewer disconnects (seen live: a bus opened right after
+# another got 408/500 on every cam). A released slot therefore keeps
+# counting against its port for this long — handing that port out sooner
+# only turns an honest 503 into a 408 that looks like a dead camera.
+# ponytail: 120s is a starting estimate; tune from "cooling" in the pod logs.
+VENDOR_LINGER = 120
+
 # Auth-error codes from Appendix 1 that a re-login can fix. Anything else
 # (device offline, no data) must not trigger one — a needless login
 # invalidates the key every other viewer is holding.
@@ -50,6 +58,7 @@ class Adapter:
 
         self._active_lock = threading.Lock()
         self._active = {}  # slot_key ({bus}_{cam}) -> (last_renewed monotonic, port)
+        self._cooling = {}  # slot_key -> (released monotonic, port): stopped, vendor still holding it
 
     def name(self) -> str:
         return "chemitoapi"
@@ -62,16 +71,23 @@ class Adapter:
             for k, (last, _) in list(self._active.items()):
                 if now - last > ACTIVE_SLOT_TTL:
                     del self._active[k]
+            for k, (released, _) in list(self._cooling.items()):
+                if now - released > VENDOR_LINGER:
+                    del self._cooling[k]
 
-            held = self._active.get(slot_key)
+            # Same channel again (renewal, or back to a bus just left): keep
+            # its port — the vendor's lingering session is this very channel.
+            held = self._active.get(slot_key) or self._cooling.get(slot_key)
             if held and held[1] in ports:
-                self._active[slot_key] = (now, held[1])  # renew, keep the same port
+                self._cooling.pop(slot_key, None)
+                self._active[slot_key] = (now, held[1])
                 return held[1]
 
             load = {p: 0 for p in ports}
-            for k, (_, p) in self._active.items():
-                if k != slot_key and p in load:
-                    load[p] += 1
+            for slots in (self._active, self._cooling):
+                for k, (_, p) in slots.items():
+                    if k != slot_key and p in load:
+                        load[p] += 1
             best = min(ports, key=load.get)
             if load[best] >= PORT_CHANNEL_LIMIT:
                 raise VendorError("chemitoapi", "resolve live video url", code="capacity_limit", retryable=True)
@@ -79,15 +95,23 @@ class Adapter:
             return best
 
     def release(self, channel_key: str) -> None:
-        """Frees channel_key's port slot immediately — called by
-        StreamService once a viewer explicitly stops. Safe for a key that
-        never held a slot."""
+        """Called by StreamService once a viewer explicitly stops. The slot
+        keeps counting for VENDOR_LINGER (the vendor is still holding the
+        channel), then frees. Safe for a key that never held a slot."""
+        with self._active_lock:
+            held = self._active.pop(channel_key, None)
+            if held is not None:
+                self._cooling[channel_key] = (time.monotonic(), held[1])
+
+    def _drop(self, channel_key: str) -> None:
+        """Frees immediately — for a resolve that failed, so no vendor
+        session was opened on this attempt."""
         with self._active_lock:
             self._active.pop(channel_key, None)
 
-    def _active_count(self) -> int:
+    def _counts(self) -> tuple:
         with self._active_lock:
-            return len(self._active)
+            return len(self._active), len(self._cooling)
 
     # ---- shared login session ----
 
@@ -143,13 +167,14 @@ class Adapter:
             if not ports:
                 raise VendorError("chemitoapi", "resolve live source", code="no_live_ports", retryable=True)
             port = self._claim_port(slot_key, ports)
-            print(f"chemitoapi: {slot_key}: port {port} of {ports}; {self._active_count()} channel(s) held")
+            held, cooling = self._counts()
+            print(f"chemitoapi: {slot_key}: port {port} of {ports}; {held} channel(s) held, {cooling} cooling")
             return client.live_video_url(terid, channel, req.audio, stream_type, port)
 
         try:
             url = self._call("resolve live video url", fetch)
         except Exception:
-            self.release(slot_key)  # a failed resolve must not sit on a port
+            self._drop(slot_key)  # a failed resolve must not sit on a port
             raise
         return LiveSource(kind=SourceKind.FLV, url=url, has_audio=True)
 

@@ -139,6 +139,14 @@ consequences:
   vendor session/channel — there is no sharing any more. Ten people
   watching one camera now costs the device ten channels, not one (see
   "Things to know" below for the device's actual channel ceiling).
+- **`503` = the account's 16 channels are all in use**, for `?cam=N` or for
+  a whole bus where no camera could start. Show "busy, try again shortly",
+  not "camera offline". A whole-bus call where only some cameras hit the
+  limit still returns `200` with just the cameras that started.
+- After `POST /api/bridge/stop-bus`, that bus's channels stay counted for
+  about 2 minutes, because the vendor keeps them busy that long. Reopening
+  the same bus within that time reuses them. A different bus may get `503`
+  until they free.
 
 ```json
 [

@@ -85,29 +85,14 @@ class App:
             return cfg.vendor, cfg.vendor_params
         return self.stream.roster_vendor(bus)
 
-    def ensure_stream(self, bus: str, cam: int, main: bool = True):
-        """What GET /api/stream/{id} calls for a cam that isn't already
-        active at this quality. Returns None when the bus isn't configured
-        for bridging at all, or when it's already active at the same
-        quality (caller keeps the existing entry)."""
-        key = f"{bus}_{cam}"
-        e = self.stream.direct_entry_for(key)
-        if e is not None and e.main == main:
-            return None
-        vendor, params = self.vendor_for(bus)
-        if vendor is None:
-            return None
-        return self.stream.start_stream(StreamRequest(bus=bus, cam=cam, vendor=vendor, main=main, audio=main, vendor_params=params or {}))
-
     def refresh_stream(self, bus: str, cam: int, main: bool = True):
-        """What GET /api/stream/{id}?cam=N calls — unlike ensure_stream,
-        this ALWAYS re-resolves against the vendor, even if the cam is
-        already active. It exists for the frontend's stale-URL watcher
-        (VideoPlayer.tsx's onStale): Chemito's live-video URL is single-use/
-        short-lived (confirmed live — a cached one is already dead for the
-        next connection attempt), so a reconnect after a drop needs a fresh
-        URL, not the cached one is_active would otherwise serve. Returns
-        None only when the bus isn't configured for bridging at all."""
+        """What GET /api/stream/{id} calls for each cam — ALWAYS re-resolves
+        against the vendor, even if the cam is already active: Chemito's
+        live-video URL is single-use/short-lived (confirmed live — a cached
+        one is already dead for the next connection attempt), so every
+        request needs a fresh URL, never a stored one. Re-resolving a held
+        cam renews its slot rather than taking a new one. Returns None only
+        when the bus isn't configured for bridging at all."""
         vendor, params = self.vendor_for(bus)
         if vendor is None:
             return None
@@ -136,51 +121,47 @@ class App:
         out.sort(key=lambda t: t[0])
         return out
 
-    def stream_info(self, cam: int, e) -> dict:
-        return {"cam": cam, "path": e.key, "ready": True, "kind": e.kind, "directUrl": e.embed_url or e.url}
-
     def stop_bus(self, bus_id: str) -> list:
         """Stops every currently-active cam of bus_id, releasing each one's
-        vendor capacity slot immediately (e.g. chemitoapi's per-account
-        channel limit — see vendors/chemitoapi_adapter.Adapter.release)
+        vendor capacity slot (e.g. chemitoapi's per-account channel limit —
+        see vendors/chemitoapi_adapter.Adapter.release; Chemito itself keeps
+        the channel busy a while longer, which that adapter accounts for)
         instead of leaving it to that adapter's TTL fallback. Called when the
-        frontend switches away from a bus, so the next bus's cams aren't
-        stuck waiting on a slot this one is done with."""
+        frontend switches away from a bus."""
         stopped = []
         for _, e in self.cams_for_bus(bus_id):
             if self.stream.stop_stream(e.key):
                 stopped.append(e.key)
         return stopped
 
-    def ensure_all_cams(self, bus: str, have: list, main: bool = True) -> list:
-        """Brings up every channel of bus not live yet. A channel that fails
-        to start is skipped, never fatal — one dead camera must not blank
-        the others."""
+    def ensure_all_cams(self, bus: str, main: bool = True) -> list:
+        """A fresh URL for every channel of bus. A channel that fails to
+        start is skipped, never fatal — one dead camera must not blank the
+        others. Only when none started and the account's channel limit is
+        why does it raise (capacity_limit -> 503 "try again shortly"), so
+        the page can tell "busy" apart from "this bus has no cameras"."""
         counts = self.stream.channel_counts()
         n = min(counts.get(bus, CAMS_PER_BUS_FALLBACK) or CAMS_PER_BUS_FALLBACK, CAMS_PER_BUS_CEILING)
-
-        seen = {si["cam"] for si in have}
-        pending = [cam for cam in range(1, n + 1) if cam not in seen]
-        if not pending:
-            return have
+        busy = []
 
         def start_one(cam):
             try:
-                result = self.ensure_stream(bus, cam, main)
+                result = self.refresh_stream(bus, cam, main)
             except Exception as e:
                 print(f"stream live: {bus}_{cam}: {e}")
+                if isinstance(e, VendorError) and e.code == "capacity_limit":
+                    busy.append(e)
                 return None
             if result is None:
                 return None
             return {"cam": cam, "path": result.key, "ready": True, "kind": result.kind,
                     "directUrl": result.embed_url or result.url}
 
-        with ThreadPoolExecutor(max_workers=max(1, len(pending))) as pool:
-            for si in pool.map(start_one, pending):
-                if si is not None:
-                    have.append(si)
+        with ThreadPoolExecutor(max_workers=n) as pool:
+            have = [si for si in pool.map(start_one, range(1, n + 1)) if si is not None]
 
-        have.sort(key=lambda si: si["cam"])
+        if not have and busy:
+            raise busy[0]
         return have
 
     # ---- recordings (history playback + download) ----
@@ -522,12 +503,9 @@ def make_handler(app: App):
             # tiles ask for. Fullscreen omits it and gets main + audio.
             main = (qs.get("sub") or [""])[0] != "1"
 
+            # Both forms always re-resolve — see App.refresh_stream's
+            # docstring for why a stored URL must never be served.
             if cam_filter:
-                # A specific cam is an explicit ask for a CURRENT url, not
-                # "what's already running" — always re-resolve. This is what
-                # the frontend's stale-URL watcher calls; see
-                # App.refresh_stream's docstring for why serving the cached
-                # entry here would defeat the point of that watcher.
                 want_cam = int(cam_filter)
                 result = app.refresh_stream(bus_id, want_cam, main)
                 if result is None:
@@ -535,8 +513,7 @@ def make_handler(app: App):
                 have = [{"cam": want_cam, "path": result.key, "ready": True,
                          "kind": result.kind, "directUrl": result.embed_url or result.url}]
             else:
-                have = [app.stream_info(cam, e) for cam, e in app.cams_for_bus(bus_id) if e.main == main]
-                have = app.ensure_all_cams(bus_id, have, main)
+                have = app.ensure_all_cams(bus_id, main)
 
             self._send_json(have)
 
