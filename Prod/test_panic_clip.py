@@ -95,12 +95,12 @@ def demo_http():
     threading.Thread(target=srv.serve_forever, daemon=True).start()
     base = f"http://127.0.0.1:{srv.server_port}/api/panic/BUS1"
 
-    def post(q):
+    def post(q, url=None):
         try:
-            with urllib.request.urlopen(urllib.request.Request(base + q, method="POST")) as r:
+            with urllib.request.urlopen(urllib.request.Request((url or base) + q, method="POST")) as r:
                 return r.status, __import__("json").load(r)
         except urllib.error.HTTPError as err:
-            return err.code, None
+            return err.code, __import__("json").load(err)
 
     status, body = post("?start=2026-10-01%2009:00:00&end=2026-10-01%2009:02:00&cam=2")
     assert status == 200 and (body["start"], body["end"], body["time"]) == ("2026-10-01 09:00:00", "2026-10-01 09:02:00", None)
@@ -108,7 +108,27 @@ def demo_http():
     status, body = post("?time=2026-10-01%2010:00:05")
     assert status == 200 and (body["start"], body["end"]) == ("2026-10-01 09:59:55", "2026-10-01 10:00:15")
     assert post("?start=2026-10-01%2009:00:00")[0] == 400  # end missing
-    assert post("?start=2026-10-01%2009:02:00&end=2026-10-01%2009:00:00")[0] == 400
+    status, body = post("?start=2026-10-01%2009:02:00&end=2026-10-01%2009:00:00")
+    assert status == 400 and body["error"]["code"] == "bad_request" and "end must be after start" in body["error"]["detail"]
+
+    # Every error is the same JSON shape; the 404s say which kind of "not found".
+    status, body = post("?time=2026-10-01%2009:00:05", url=base.replace("BUS1", "NOPE"))
+    err = body["error"]
+    assert (status, err["status"], err["code"], err["bus"], err["retryable"]) == (404, 404, "unknown_bus", "NOPE", False), body
+    assert err["message"] and "NOPE" in err["detail"]
+
+    f.dead_cams = {1, 2, 3}
+    status, body = post("?start=2026-10-01%2012:00:00&end=2026-10-01%2012:01:00")
+    err = body["error"]
+    assert (status, err["code"], err["start"], err["end"]) == (404, "no_recording", "2026-10-01 12:00:00", "2026-10-01 12:01:00")
+    assert set(err["cams"]) == {"1", "2", "3"}  # why each camera failed
+
+    status, body = post("", url=base.replace("/api/panic/BUS1", "/api/nope"))
+    assert (status, body["error"]["code"]) == (404, "not_found")
+
+    app.api_token = "secret"
+    status, body = post("?time=2026-10-01%2009:00:05")
+    assert (status, body["error"]["code"]) == (401, "unauthorized")
     srv.shutdown()
     print("ok http")
 

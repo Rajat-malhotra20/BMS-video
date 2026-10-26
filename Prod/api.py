@@ -171,7 +171,7 @@ class App:
         Raises VendorError not_implemented for vendors that don't (sumithlive)."""
         vendor, params = self.vendor_for(bus)
         if vendor is None:
-            raise VendorError("bms", f'bus "{bus}"', code="device_offline")
+            raise VendorError("bms", f'bus "{bus}"', code="unknown_bus", details={"bus": bus})
         adapter = self.stream.registry.get(vendor)
         if not hasattr(adapter, "playback"):
             raise VendorError(vendor, "recordings", code="not_implemented")
@@ -239,7 +239,8 @@ class App:
             with self._panic_lock:
                 self._panic.pop((bus, s, e), None)
             raise VendorError("chemitoapi", f"panic playback {bus} {start}..{end}: {entry['errors']}",
-                              code="no_recording")
+                              code="no_recording",
+                              details={"bus": bus, "start": start, "end": end, "cams": entry["errors"]})
 
         def stop_all():
             for p in entry["cams"]:
@@ -273,21 +274,51 @@ def parse_cams(qs, default: str = "1") -> list:
     return [int(c) for c in ((qs.get("cam") or [default])[0]).split(",") if c.strip()]
 
 
+# Every error body is {"error": {"status", "code", "message", "retryable",
+# "detail", ...extra}}. code is stable for the frontend to switch on;
+# message is safe to show a user as-is; detail is the raw server/vendor text
+# for debugging. code -> (status, message, retryable):
+ERRORS = {
+    "bad_request": (400, "A parameter is missing or in the wrong format.", False),
+    "unauthorized": (401, "Missing or wrong API token.", False),
+    "not_found": (404, "No such API endpoint.", False),
+    "unknown_bus": (404, "This bus is not known to the server. Use a bus id from GET /api/fleet.", False),
+    "device_offline": (404, "The bus is offline, so its recorder can't be reached.", True),
+    "no_recording": (404, "No recording found for that time on any camera.", False),
+    "no_file": (404, "That file doesn't exist for this download task.", False),
+    "internal_error": (500, "Unexpected server error.", True),
+    "not_implemented": (501, "This bus's camera vendor doesn't support this.", False),
+    "vendor_error": (502, "The camera vendor returned an error.", True),
+    # The account's own channel ceiling: "try again shortly," not "broken."
+    "capacity_busy": (503, "All live camera channels are in use. Try again shortly.", True),
+}
+
+
+def error_code(err: Exception) -> str:
+    if isinstance(err, ValueError):
+        return "bad_request"
+    if not isinstance(err, VendorError):
+        return "internal_error"
+    if err.code == "capacity_limit":
+        return "capacity_busy"
+    if err.code in ERRORS:
+        return err.code
+    vendor_code = getattr(err.cause, "code", None)
+    if vendor_code == 401:  # vendor: terminal not online
+        return "device_offline"
+    if vendor_code in (212, 215):  # vendor: no data / no file
+        return "no_recording"
+    return "vendor_error"
+
+
 def error_status(err: Exception) -> int:
-    if isinstance(err, VendorError):
-        if err.code == "capacity_limit":
-            # The account's own channel ceiling is intentionally kept below
-            # the vendor's real limit — this means "try again shortly," not
-            # "something is broken."
-            return 503
-        if err.code in ("device_offline", "no_recording", "no_file"):
-            return 404
-        if getattr(err.cause, "code", None) in (212, 215, 401):  # vendor: no data / no file / terminal offline
-            return 404
-        if err.code == "not_implemented":
-            return 501
-        return 502
-    return 502
+    return ERRORS[error_code(err)][0]
+
+
+def error_body(code: str, detail: str = "", **extra) -> dict:
+    status, message, retryable = ERRORS[code]
+    return {"error": {"status": status, "code": code, "message": message, "retryable": retryable,
+                      "detail": detail, **extra}}
 
 
 def make_handler(app: App):
@@ -312,14 +343,13 @@ def make_handler(app: App):
             self.end_headers()
             self.wfile.write(body)
 
-        def _send_error(self, message, status):
-            body = (message + "\n").encode()
-            self.send_response(status)
-            self.send_header("Content-Type", "text/plain; charset=utf-8")
-            self._send_cors()
-            self.send_header("Content-Length", str(len(body)))
-            self.end_headers()
-            self.wfile.write(body)
+        def _send_error(self, code, detail="", **extra):
+            body = error_body(code, detail, **extra)
+            self._send_json(body, body["error"]["status"])
+
+        def _send_exception(self, err):
+            details = err.details if isinstance(err, VendorError) else {}
+            self._send_error(error_code(err), str(err), **details)
 
         def _send_cors(self):
             self.send_header("Access-Control-Allow-Origin", app.cors_origin)
@@ -385,20 +415,18 @@ def make_handler(app: App):
                     if parts[1:] == ["file"]:
                         return self._handle_download_file(taskid, (qs.get("name") or [""])[0])
 
-                self._send_error("not found", 404)
+                self._send_error("not_found", f"{self.command} {path}")
             except ConnectionError:  # BrokenPipe / Reset / Aborted
                 # Client left before we answered (tab closed, bus switched,
                 # proxy timeout). Nothing to send; trying to write an error
                 # to the same dead socket just raises again.
                 print(f"{self.command} {self.path}: client disconnected before response")
                 self.close_connection = True  # don't try to read another request off it
-            except ValueError as e:
-                self._send_error(f"bad request: {e}", 400)
-            except VendorError as e:
-                self._send_error(str(e), error_status(e))
+            except (ValueError, VendorError) as e:
+                self._send_exception(e)
             except Exception as e:  # pragma: no cover - last-resort 500
                 print(f"handler error: {e}")
-                self._send_error("internal error", 500)
+                self._send_error("internal_error")
 
         def do_POST(self):
             parsed = urlparse(self.path)
@@ -412,7 +440,7 @@ def make_handler(app: App):
                 if path == "/api/bridge/stop-bus":
                     bus_id = (qs.get("bus") or [""])[0]
                     if not bus_id:
-                        return self._send_error("bus query parameter is required", 400)
+                        return self._send_error("bad_request", "bus query parameter is required")
                     stopped = app.stop_bus(bus_id)
                     return self._send_json({"bus": bus_id, "stopped": stopped})
 
@@ -420,7 +448,7 @@ def make_handler(app: App):
                     action = (qs.get("action") or [""])[0]
                     sn = (qs.get("sn") or [""])[0]
                     if action not in ("pause", "resume", "seek", "stop") or not sn:
-                        return self._send_error("action (pause|resume|seek|stop) and sn are required", 400)
+                        return self._send_error("bad_request", "action (pause|resume|seek|stop) and sn are required")
                     start = parse_time(qs, "start") if action == "seek" else ""
                     app.chemito().playback_control(action, sn, start)
                     return self._send_json({"ok": True})
@@ -448,27 +476,28 @@ def make_handler(app: App):
                         taskid = adapter.add_download(params, bus_id, start, end, parse_cams(qs), main=not sub)
                         return self._send_json({"taskId": taskid, "date": start[:10]})
 
-                self._send_error("not found", 404)
+                self._send_error("not_found", f"{self.command} {path}")
             except ConnectionError:  # BrokenPipe / Reset / Aborted
                 # Client left before we answered (tab closed, bus switched,
                 # proxy timeout). Nothing to send; trying to write an error
                 # to the same dead socket just raises again.
                 print(f"{self.command} {self.path}: client disconnected before response")
                 self.close_connection = True  # don't try to read another request off it
-            except ValueError as e:
-                self._send_error(f"bad request: {e}", 400)
-            except VendorError as e:
-                self._send_error(str(e), error_status(e))
+            except (ValueError, VendorError) as e:
+                self._send_exception(e)
             except Exception as e:  # pragma: no cover - last-resort 500
                 print(f"handler error: {e}")
-                self._send_error("internal error", 500)
+                self._send_error("internal_error")
 
         def _unauthorized(self):
+            body = json.dumps(error_body("unauthorized")).encode()
             self.send_response(401)
             self.send_header("WWW-Authenticate", 'Bearer realm="fleet-bms-prod"')
+            self.send_header("Content-Type", "application/json")
             self._send_cors()
+            self.send_header("Content-Length", str(len(body)))
             self.end_headers()
-            self.wfile.write(b"unauthorized\n")
+            self.wfile.write(body)
 
         # ---- handlers ----
 
@@ -509,7 +538,7 @@ def make_handler(app: App):
                 want_cam = int(cam_filter)
                 result = app.refresh_stream(bus_id, want_cam, main)
                 if result is None:
-                    return self._send_error(f'bus "{bus_id}" is not configured for bridging', 404)
+                    return self._send_error("unknown_bus", f'bus "{bus_id}" is not configured for bridging', bus=bus_id)
                 have = [{"cam": want_cam, "path": result.key, "ready": True,
                          "kind": result.kind, "directUrl": result.embed_url or result.url}]
             else:
@@ -534,7 +563,7 @@ def make_handler(app: App):
             URL carries the account's shared key, which must never reach a
             browser."""
             if not name:
-                return self._send_error("name query parameter is required", 400)
+                return self._send_error("bad_request", "name query parameter is required")
             resp = app.chemito().open_download(taskid, name)
             try:
                 self.send_response(200)

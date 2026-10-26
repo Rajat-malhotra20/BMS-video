@@ -66,12 +66,14 @@ class VendorError(Exception):
     """Normalizes a failure from any adapter so the HTTP layer can map it to
     a status code in one place instead of string-matching errors."""
 
-    def __init__(self, vendor: str, op: str, code: str = "", retryable: bool = False, cause: Optional[BaseException] = None):
+    def __init__(self, vendor: str, op: str, code: str = "", retryable: bool = False, cause: Optional[BaseException] = None,
+                 details: Optional[dict] = None):
         self.vendor = vendor
         self.op = op
         self.code = code
         self.retryable = retryable
         self.cause = cause
+        self.details = details or {}  # extra fields for the JSON error body (bus, window, per-cam errors)
         detail = str(cause) if cause is not None else code
         super().__init__(f"{vendor}: {op}: {detail}")
 

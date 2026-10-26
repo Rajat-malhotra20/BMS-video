@@ -37,6 +37,42 @@ token; a missing or wrong one returns `401`.
 If the deployment has no token configured the API answers without one, but
 do not rely on that: it is the unlocked-development state, not the contract.
 
+### Errors
+
+Every error (`4xx`/`5xx`) has the same JSON body:
+
+```json
+{ "error": {
+    "status": 404,
+    "code": "unknown_bus",
+    "message": "This bus is not known to the server. Use a bus id from GET /api/fleet.",
+    "retryable": false,
+    "detail": "bms: bus \"DL1PD8617\": unknown_bus",
+    "bus": "DL1PD8617"
+} }
+```
+
+- **`code`:** switch on this. It never changes wording.
+- **`message`:** safe to show a user as-is.
+- **`retryable`:** `true` means the same request may work later.
+- **`detail`:** raw server/vendor text, for logs and bug reports, not for users.
+- **Extra fields** depending on the error: `bus`; for panic also `start`,
+  `end` and `cams` (`{"1": "why cam 1 failed", ...}`).
+
+| Status | `code` | Meaning |
+|---|---|---|
+| 400 | `bad_request` | Missing or badly formatted parameter (`detail` says which) |
+| 401 | `unauthorized` | Missing or wrong API token |
+| 404 | `not_found` | No such endpoint (check method and path) |
+| 404 | `unknown_bus` | Bus id isn't in `GET /api/fleet`; check the exact id |
+| 404 | `device_offline` | Bus is offline; its recorder can't be reached (retryable) |
+| 404 | `no_recording` | No recording for that time on any camera |
+| 404 | `no_file` | Download file name doesn't exist for that task |
+| 500 | `internal_error` | Server bug, report it with `detail` |
+| 501 | `not_implemented` | This bus's vendor doesn't support the feature (e.g. recordings) |
+| 502 | `vendor_error` | Camera vendor returned an error (retryable) |
+| 503 | `capacity_busy` | All live camera channels in use; show "busy, try again shortly" |
+
 ---
 
 ## 1. List every bus
@@ -285,7 +321,9 @@ POST /api/panic/{busId}?time=2026-10-01 09:00:05[&cam=1,2]     shortcut: window 
 - The server stops the sessions itself once the window has played, plus ~100s
   slack for a slow first frame, so nothing past `end` keeps the bus streaming
   over 4G. Calling again after that starts a fresh replay.
-- `404` = no recording on any camera for that time (or unknown bus).
+- `404` with `code` `no_recording` means no camera had a recording for that
+  window. `error.cams` says why each camera failed. `unknown_bus` means the
+  bus id is wrong (see [Errors](#errors)).
 - The frontend's panic banner has a **Watch −10s / +10s** button that calls
   this same endpoint.
 
