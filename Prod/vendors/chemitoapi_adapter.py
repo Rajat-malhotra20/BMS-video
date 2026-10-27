@@ -210,6 +210,24 @@ class Adapter:
             raise VendorError("chemitoapi", "record flv video", code="no_recording")
         return {"cam": cam, "kind": SourceKind.FLV, "directUrl": url, "sn": sn}
 
+    def server_playback(self, vendor_params: dict, cam: int, start: str) -> dict:
+        """Like playback(), from the recording stored on Chemito's server."""
+        terid = vendor_params.get("terid", "")
+        url, sn = self._call("server flv video", lambda c: c.server_flv(terid, start, cam))
+        if not url:
+            raise VendorError("chemitoapi", "server flv video", code="no_recording")
+        return {"cam": cam, "kind": SourceKind.FLV, "directUrl": url, "sn": sn}
+
+    def playback_range(self, vendor_params: dict, cam: int, start: str, end: str, main: bool = True) -> dict:
+        """HLS of exactly start..end (the panic window). Unlike playback()
+        there's no device session: nothing to stop, no "sn"."""
+        terid = vendor_params.get("terid", "")
+        st = RECORD_STREAM_MAIN if main else RECORD_STREAM_SUB
+        url = self._call("record hls video", lambda c: c.record_hls(terid, start, end, cam, st))
+        if not url:
+            raise VendorError("chemitoapi", "record hls video", code="no_recording")
+        return {"cam": cam, "kind": SourceKind.HLS, "directUrl": url}
+
     def playback_control(self, action: str, sn: str, start: str = "") -> None:
         self._call(f"flv {action}", lambda c: c.flv_control(action, sn, start))
 

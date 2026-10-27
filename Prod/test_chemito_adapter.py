@@ -5,6 +5,7 @@ from vendorclients import chemitoapi as raw
 from vendors import chemitoapi_adapter as mod
 
 PORTS = [22060, 22061, 22062, 22063]
+REAL_CLIENT = raw.Client  # demo() swaps the module's Client for FakeClient
 
 
 class FakeClient:
@@ -122,6 +123,11 @@ def demo_sub_main():
     # Vendor URLs are single-use: asking again re-resolves, never serves a stored one.
     assert app.ensure_all_cams("BUS1", main=False) == grid and len(V.calls) == 4
     assert app.refresh_stream("BUS1", 1, main=True).url == "u1m" and V.calls[-1] == (1, True, True)
+
+    # A camera's own Stop releases just that camera; stop-bus the rest.
+    assert app.stop_bus("BUS1", cam=1) == ["BUS1_1"]
+    assert [c for c, _ in app.cams_for_bus("BUS1")] == [2]
+    assert app.stop_bus("BUS1") == ["BUS1_2"] and app.cams_for_bus("BUS1") == []
     print("ok sub/main")
 
 
@@ -155,7 +161,28 @@ def demo_bus_busy():
     print("ok busy")
 
 
+def demo_history_paths():
+    """§8.3/8.4/8.5 request paths and params, exactly as the vendor doc spells them."""
+    from urllib.parse import parse_qs, urlsplit
+    seen = []
+    c = REAL_CLIENT("https://gw:22056")
+    c.key = "K"
+    c._env = lambda url, *a, **k: seen.append(url) or {"data": [{"url": "u"}], "sn": "S"}
+    assert c.server_flv("T", "2026-10-01 09:00:00", 2) == ("u", "S")
+    assert c.record_flv("T", "2026-10-01 09:00:00", 2, 1) == ("u", "S")
+    c.record_hls("T", "2026-10-01 09:00:00", "2026-10-01 09:01:00", 2, 0)
+    got = [(urlsplit(u).path, {k: v[0] for k, v in parse_qs(urlsplit(u).query).items()}) for u in seen]
+    assert got == [
+        ("/api/v1/basic/server/video", {"key": "K", "terid": "T", "starttime": "2026-10-01 09:00:00", "chl": "2"}),
+        ("/api/v1/basic/record/flv/video", {"key": "K", "terid": "T", "starttime": "2026-10-01 09:00:00", "chl": "2", "st": "1"}),
+        ("/api/v1/basic/record/video", {"key": "K", "terid": "T", "starttime": "2026-10-01 09:00:00",
+                                        "endtime": "2026-10-01 09:01:00", "chl": "2", "st": "0"}),
+    ], got
+    print("ok history paths")
+
+
 if __name__ == "__main__":
     demo()
     demo_sub_main()
     demo_bus_busy()
+    demo_history_paths()

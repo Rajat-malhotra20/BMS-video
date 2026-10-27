@@ -179,6 +179,10 @@ consequences:
   a whole bus where no camera could start. Show "busy, try again shortly",
   not "camera offline". A whole-bus call where only some cameras hit the
   limit still returns `200` with just the cameras that started.
+- `POST /api/bridge/stop-bus?bus={id}` releases every camera of the bus
+  (call it when leaving the bus); add `&cam=N` to release one camera (its
+  Stop button). Only closing the player is not enough: the server keeps the
+  channel counted until its 5-minute idle timeout.
 - After `POST /api/bridge/stop-bus`, that bus's channels stay counted for
   about 2 minutes, because the vendor keeps them busy that long. Reopening
   the same bus within that time reuses them. A different bus may get `503`
@@ -313,8 +317,15 @@ POST /api/panic/{busId}?time=2026-10-01 09:00:05[&cam=1,2]     shortcut: window 
 
 - Times are bus local time, `YYYY-MM-DD HH:MM:SS` (space as `%20`). Default
   is every camera. `end` must be after `start` (else `400`).
-- Play each `directUrl` like any `kind: "flv"`. It runs in real time from
-  `start`, so it reaches `end` (end − start) seconds in.
+- Each camera says which `source` served it (first one that answers):
+  1. `"server"`: the copy stored on Chemito's server. `kind: "flv"` + `sn`.
+     Doesn't need the bus to stream anything.
+  2. `"device-hls"`: the bus's own recorder, HLS of exactly `start`..`end`.
+     `kind: "hls"`, ends by itself, no `sn`, nothing to stop.
+  3. `"device"`: the bus's own recorder as FLV. `kind: "flv"` + `sn`.
+  FLV plays in real time from `start`, so it reaches `end` (end − start)
+  seconds in; stop it with its `sn`. Both device sources need the bus online.
+  A camera with no source lists every reason in `errors`, in that order.
 - Safe to call more than once: calls for the same bus whose start and end are
   each within 10s of an open window (the alarm system, every open browser, a
   repeated press) all get the **same** sessions.

@@ -169,15 +169,32 @@ class Client:
             "chl": ",".join(str(c) for c in channels), "st": stream_type, "pbt": 0,
         }) or []
 
-    def record_flv(self, terid: str, start: str, channel: int, stream_type: int) -> tuple:
-        """GET /api/v1/basic/record/flv/video — device playback as HTTP-FLV
-        starting at `start`. Returns (url, sn); sn drives pause/resume/seek/stop."""
-        env = self._env(f"{self.base_url}/api/v1/basic/record/flv/video?" + urllib.parse.urlencode({
-            "key": self.key, "terid": terid, "starttime": start, "chl": channel, "st": stream_type,
-        }))
+    def _flv(self, path: str, params: dict) -> tuple:
+        env = self._env(f"{self.base_url}{path}?" + urllib.parse.urlencode({"key": self.key, **params}))
         data = env.get("data") or []
         url = (data[0] if isinstance(data, list) and data else data or {}).get("url", "")
         return url, env.get("sn", "")
+
+    def record_flv(self, terid: str, start: str, channel: int, stream_type: int) -> tuple:
+        """GET /api/v1/basic/record/flv/video (doc §8.4) — playback from the
+        bus's own recorder as HTTP-FLV starting at `start`, streamed by the
+        bus over 4G. Returns (url, sn); sn drives pause/resume/seek/stop."""
+        return self._flv("/api/v1/basic/record/flv/video",
+                         {"terid": terid, "starttime": start, "chl": channel, "st": stream_type})
+
+    def server_flv(self, terid: str, start: str, channel: int) -> tuple:
+        """GET /api/v1/basic/server/video (doc §8.5) — like record_flv, but
+        from the copy stored on Chemito's server, so the bus needn't stream
+        anything. Same (url, sn) and flv pause/resume/seek/stop (§8.6-8.9)."""
+        return self._flv("/api/v1/basic/server/video", {"terid": terid, "starttime": start, "chl": channel})
+
+    def record_hls(self, terid: str, start: str, end: str, channel: int, stream_type: int) -> str:
+        """GET /api/v1/basic/record/video (doc §8.3) — HLS (m3u8) of exactly
+        start..end on one channel from the bus's recorder, no session to stop."""
+        data = self._get("/api/v1/basic/record/video", {
+            "terid": terid, "starttime": start, "endtime": end, "chl": channel, "st": stream_type,
+        })
+        return (data[0] if isinstance(data, list) and data else data or {}).get("url", "")
 
     def flv_control(self, action: str, sn: str, start: str = "") -> None:
         """POST /api/v1/basic/flv/{pause,resume,seek,stop}."""

@@ -82,6 +82,40 @@ def demo():
     print("ok")
 
 
+def demo_sources():
+    """Per cam: server-stored copy, else device HLS of the exact window, else device FLV; only FLV sessions get stopped."""
+    class FakeAll(Fake):
+        def __init__(self):
+            super().__init__()
+            self.on_server, self.with_hls = {1}, {2}
+
+        def server_playback(self, params, cam, start):
+            if cam not in self.on_server:
+                raise RuntimeError("not on server")
+            return {"cam": cam, "kind": "flv", "directUrl": f"s{cam}", "sn": f"srv{cam}"}
+
+        def playback_range(self, params, cam, start, end, main=True):
+            if cam not in self.with_hls:
+                raise RuntimeError("no hls")
+            return {"cam": cam, "kind": "hls", "directUrl": f"h{cam}.m3u8", "range": (start, end)}
+
+    timers.clear()
+    api.threading.Timer = CapturedTimer
+    f = FakeAll()
+    app = api.App(StreamService(Registry(f)), {}, "", "*")
+    e = app.panic_playback("BUS1", "2026-10-01 08:59:55", "2026-10-01 09:00:15")
+    assert [(p["cam"], p["source"], p["kind"]) for p in e["cams"]] == [
+        (1, "server", "flv"), (2, "device-hls", "hls"), (3, "device", "flv")], e["cams"]
+    assert e["cams"][1]["range"] == ("2026-10-01 08:59:55", "2026-10-01 09:00:15") and e["errors"] == {}
+    timers[0].fn()
+    assert f.stopped == [("stop", "srv1"), ("stop", "sn1")], f.stopped  # the HLS cam has no session
+
+    f.dead_cams = {3}  # no source for cam 3 -> every reason, in order
+    e2 = app.panic_playback("BUS1", "2026-10-01 10:00:00", "2026-10-01 10:00:20")
+    assert e2["errors"][3] == "server: not on server; device-hls: no hls; device: no recording", e2["errors"]
+    print("ok sources")
+
+
 def demo_http():
     """?start&end plays exactly that window; ?time still means press -10s..+10s."""
     import threading
@@ -135,4 +169,5 @@ def demo_http():
 
 if __name__ == "__main__":
     demo()
+    demo_sources()
     demo_http()

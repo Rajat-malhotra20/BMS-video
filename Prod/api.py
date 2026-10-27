@@ -121,15 +121,18 @@ class App:
         out.sort(key=lambda t: t[0])
         return out
 
-    def stop_bus(self, bus_id: str) -> list:
-        """Stops every currently-active cam of bus_id, releasing each one's
+    def stop_bus(self, bus_id: str, cam: int = None) -> list:
+        """Stops every currently-active cam of bus_id (or just `cam` - a
+        camera's own Stop button), releasing each one's
         vendor capacity slot (e.g. chemitoapi's per-account channel limit —
         see vendors/chemitoapi_adapter.Adapter.release; Chemito itself keeps
         the channel busy a while longer, which that adapter accounts for)
         instead of leaving it to that adapter's TTL fallback. Called when the
         frontend switches away from a bus."""
         stopped = []
-        for _, e in self.cams_for_bus(bus_id):
+        for c, e in self.cams_for_bus(bus_id):
+            if cam is not None and c != cam:
+                continue
             if self.stream.stop_stream(e.key):
                 stopped.append(e.key)
         return stopped
@@ -183,11 +186,13 @@ class App:
     # ---- panic playback: a given window, nothing saved ----
 
     def panic_playback(self, bus: str, start: str, end: str, cams: list = None, alarm_time: str = None) -> dict:
-        """Starts device playback of every camera (or `cams`) from `start`.
-        Playback runs in real time, so it reaches `end` (end - start) seconds
-        after it starts; the sessions are stopped then, plus
-        PANIC_PLAY_SLACK for a slow first frame, so nothing past the window
-        keeps the bus streaming over 4G.
+        """Playback of every camera (or `cams`) for start..end, each with the
+        "source" that served it (see open_one): FLV from `start` with an "sn"
+        ("server" / "device"), or HLS of exactly the window without one
+        ("device-hls"). FLV runs in real time,
+        so it reaches `end` (end - start) seconds after it starts; those
+        sessions are stopped then, plus PANIC_PLAY_SLACK for a slow first
+        frame, so nothing past the window keeps the bus streaming over 4G.
 
         Idempotent while the sessions are open: the alarm system, every open
         browser and a driver pressing again within PANIC_AFTER (start and end
@@ -222,12 +227,28 @@ class App:
             n = min(self.stream.channel_counts().get(bus) or CAMS_PER_BUS_FALLBACK, CAMS_PER_BUS_CEILING)
             cams = list(range(1, n + 1))
 
+        # Per camera, first source that answers (doc §8): the copy stored on
+        # Chemito's server, then the bus's own recorder as HLS of exactly the
+        # window, then as FLV from start. Both device ones need the bus to
+        # stream the recording over 4G. Fallback is on API errors only - a URL
+        # that later fails to play isn't caught here.
+        attempts = (
+            ("server", "server_playback", lambda f, cam: f(params, cam, start)),
+            ("device-hls", "playback_range", lambda f, cam: f(params, cam, start, end)),
+            ("device", "playback", lambda f, cam: f(params, cam, start)),
+        )
+
         def open_one(cam):
-            try:
-                return adapter.playback(params, cam, start)
-            except Exception as e:
-                entry["errors"][cam] = str(e)
-                return None
+            failed = []
+            for source, method, call in attempts:
+                if not hasattr(adapter, method):
+                    continue
+                try:
+                    return {**call(getattr(adapter, method), cam), "source": source}
+                except Exception as e:
+                    failed.append(f"{source}: {e}")
+            entry["errors"][cam] = "; ".join(failed)
+            return None
 
         try:
             with ThreadPoolExecutor(max_workers=len(cams)) as pool:
@@ -244,6 +265,8 @@ class App:
 
         def stop_all():
             for p in entry["cams"]:
+                if not p.get("sn"):  # HLS: no device session to stop
+                    continue
                 try:
                     adapter.playback_control("stop", p["sn"])
                 except Exception as e:
@@ -441,7 +464,8 @@ def make_handler(app: App):
                     bus_id = (qs.get("bus") or [""])[0]
                     if not bus_id:
                         return self._send_error("bad_request", "bus query parameter is required")
-                    stopped = app.stop_bus(bus_id)
+                    cam = (qs.get("cam") or [""])[0]
+                    stopped = app.stop_bus(bus_id, int(cam) if cam else None)
                     return self._send_json({"bus": bus_id, "stopped": stopped})
 
                 if path == "/api/playback/control":
