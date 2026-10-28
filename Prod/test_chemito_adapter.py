@@ -24,21 +24,27 @@ class FakeClient:
     def use_key(self, key):
         self.key = key
 
+    port_calls = 0
+
     def live_ports(self):
+        FakeClient.port_calls += 1
         if self.key in FakeClient.dead_keys:
             raise raw.APIError(204)
         return PORTS
 
     def live_video_url(self, terid, chl, audio, st, port):
+        if self.key in FakeClient.dead_keys:
+            raise raw.APIError(204)
         if terid == FakeClient.fail_terid:
             raise raw.APIError(401)
         return f"https://gw:{port}/live.flv?devid={terid}&chl={chl}"
 
 
 def expire_cooling(a):
-    """Pretends VENDOR_LINGER has passed for every released slot."""
-    for k, (t, p) in list(a._cooling.items()):
-        a._cooling[k] = (t - mod.VENDOR_LINGER - 1, p)
+    """Pretends VENDOR_LINGER has passed for every released slot, on every account."""
+    for acct in a._accounts:
+        for k, (t, p) in list(acct._cooling.items()):
+            acct._cooling[k] = (t - mod.VENDOR_LINGER - 1, p)
 
 
 def req(bus, cam):
@@ -88,15 +94,79 @@ def demo():
         raise AssertionError("expected vendor error")
     except VendorError as e:
         assert e.code != "capacity_limit"
-    assert "BAD_1" not in a._active and "BAD_1" not in a._cooling
+    assert not a._accounts[0].holds("BAD_1")
     FakeClient.fail_terid = None
 
     # Expired key -> exactly one re-login, then success.
-    FakeClient.dead_keys.add(a._key)
+    FakeClient.dead_keys.add(a._accounts[0]._key)
     before = FakeClient.logins
     assert a.resolve_live_source(req("B9", 1)).url
     assert FakeClient.logins == before + 1
     print("ok")
+
+
+def demo_accounts():
+    """Account 1 full -> next cam goes to account 2, then 3; a cam stays on its
+    account; freed room on account 1 is used first again; all full -> 503."""
+    mod.rawclient.Client = FakeClient
+    a = mod.Adapter("https://gw", "u1", "p", [("u2", "p"), ("u3", "p")])
+    one, two, three = a._accounts
+    on = lambda key: [acct.username for acct in a._accounts if key in acct._active]
+
+    for c in range(1, 17):
+        a.resolve_live_source(req("A", c))
+    assert one._counts() == (16, 0) and two._counts() == (0, 0)
+    a.resolve_live_source(req("B", 1))                     # 17th channel
+    assert on("B_1") == ["u2"]
+    for c in range(2, 18):
+        a.resolve_live_source(req("B", c))                 # fills account 2 (16), B_17 -> account 3
+    assert two._counts() == (16, 0) and on("B_17") == ["u3"]
+    assert len({acct._key for acct in a._accounts}) == 3   # one login per account
+
+    a.release("A_1"); expire_cooling(a)                    # room on account 1 again
+    a.resolve_live_source(req("B", 1))                     # renewal stays on account 2
+    assert on("B_1") == ["u2"]
+    a.resolve_live_source(req("C", 1))                     # a new cam takes account 1's free slot
+    assert on("C_1") == ["u1"]
+
+    a.release("B_17")                                      # stop-bus reaches account 3 too
+    assert three._counts() == (0, 1)
+    a.resolve_live_source(req("B", 17))                    # back to it within the cooldown: same account
+    assert on("B_17") == ["u3"]
+
+    for c in range(1, 16):
+        a.resolve_live_source(req("D", c))                 # account 3: 15 more = 16
+    try:
+        a.resolve_live_source(req("X", 1))
+        raise AssertionError("every account full should hit capacity_limit")
+    except VendorError as e:
+        assert e.code == "capacity_limit"
+    assert on("X_1") == []
+    print("ok accounts")
+
+
+def demo_ports_cache():
+    """Ports fetched once per account, not per camera; full accounts are skipped
+    with no vendor call; a failed link drops that account's cache."""
+    mod.rawclient.Client = FakeClient
+    a = mod.Adapter("https://gw", "u1", "p", [("u2", "p"), ("u3", "p")])
+    FakeClient.port_calls = 0
+    for c in range(1, 33):
+        a.resolve_live_source(req("A", c))   # fills accounts 1 and 2
+    assert FakeClient.port_calls == 2, FakeClient.port_calls
+    for c in range(1, 11):
+        a.resolve_live_source(req("B", c))   # account 3; 1 and 2 skipped from memory
+    assert FakeClient.port_calls == 3, FakeClient.port_calls
+
+    FakeClient.fail_terid = "BAD"
+    try:
+        a.resolve_live_source(req("BAD", 1))
+    except VendorError:
+        pass
+    FakeClient.fail_terid = None
+    a.resolve_live_source(req("B", 11))
+    assert FakeClient.port_calls == 4, FakeClient.port_calls  # account 3 refetched once
+    print("ok ports cache")
 
 
 def demo_sub_main():
@@ -183,6 +253,8 @@ def demo_history_paths():
 
 if __name__ == "__main__":
     demo()
+    demo_accounts()
+    demo_ports_cache()
     demo_sub_main()
     demo_bus_busy()
     demo_history_paths()

@@ -103,8 +103,16 @@ def main():
     chemito_acct = vendor_accounts.get("chemitoapi", settings.VendorAccount())
     sumith_acct = vendor_accounts.get("sumithlive", settings.VendorAccount())
 
+    # More accounts for live cams once the main one's channels are full, in
+    # list order. A password left empty comes from VENDOR_CHEMITOAPI_PASSWORD_1,
+    # _2, ... by position (media-live1 -> _1 with the usual naming).
+    chemito_more = [
+        (a.get("username", ""), a.get("password") or os.environ.get(f"VENDOR_CHEMITOAPI_PASSWORD_{n}", ""))
+        for n, a in enumerate(chemito_acct.extra.get("liveAccounts", []), start=1)
+    ]
+
     registry = Registry(
-        ChemitoAdapter(chemito_acct.base_url, chemito_acct.username, chemito_acct.password),
+        ChemitoAdapter(chemito_acct.base_url, chemito_acct.username, chemito_acct.password, chemito_more),
         SumithliveAdapter(sumith_acct.base_url, sumith_acct.username, sumith_acct.password,
                            default_project_id=sumith_acct.extra.get("projectId", "")),
     )

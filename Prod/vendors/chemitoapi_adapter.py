@@ -37,6 +37,10 @@ ACTIVE_SLOT_TTL = 5 * 60
 # ponytail: 120s is a starting estimate; tune from "cooling" in the pod logs.
 VENDOR_LINGER = 120
 
+# An account's live ports practically never change; caching them means a
+# full account is skipped without a vendor round trip.
+PORTS_CACHE_TTL = 5 * 60
+
 # Auth-error codes from Appendix 1 that a re-login can fix. Anything else
 # (device offline, no data) must not trigger one — a needless login
 # invalidates the key every other viewer is holding.
@@ -47,7 +51,11 @@ RECORD_STREAM_MAIN = 1
 RECORD_STREAM_SUB = 0
 
 
-class Adapter:
+class _Account:
+    """One Chemito login: its own session key, its own len(ports) x 4 live
+    slots and their cooldown. The vendor counts both per account, so each
+    extra account is an independent set of 16 channels."""
+
     def __init__(self, base_url: str, username: str, password: str):
         self.base_url = base_url
         self.username = username
@@ -59,9 +67,20 @@ class Adapter:
         self._active_lock = threading.Lock()
         self._active = {}  # slot_key ({bus}_{cam}) -> (last_renewed monotonic, port)
         self._cooling = {}  # slot_key -> (released monotonic, port): stopped, vendor still holding it
+        self._ports, self._ports_at = [], 0.0
 
-    def name(self) -> str:
-        return "chemitoapi"
+    def live_ports(self) -> list:
+        """Cached for PORTS_CACHE_TTL; forget_ports() forces a refetch."""
+        if self._ports and time.monotonic() - self._ports_at < PORTS_CACHE_TTL:
+            return self._ports
+        ports = self._call("live ports", lambda c: c.live_ports())
+        if not ports:
+            raise VendorError("chemitoapi", "resolve live source", code="no_live_ports", retryable=True)
+        self._ports, self._ports_at = ports, time.monotonic()
+        return ports
+
+    def forget_ports(self) -> None:
+        self._ports_at = 0.0
 
     # ---- port slots: least-loaded, sticky per channel, capped per port ----
 
@@ -113,6 +132,11 @@ class Adapter:
         with self._active_lock:
             return len(self._active), len(self._cooling)
 
+    def holds(self, channel_key: str) -> bool:
+        """Has this channel live, or still cooling (going back to it reuses it)."""
+        with self._active_lock:
+            return channel_key in self._active or channel_key in self._cooling
+
     # ---- shared login session ----
 
     def _session(self) -> rawclient.Client:
@@ -150,6 +174,30 @@ class Adapter:
             except Exception as e:
                 raise VendorError("chemitoapi", op, cause=e) from e
 
+
+class Adapter:
+    """Live cams fill the first account, then overflow onto the next with a
+    free port (account 2, 3, ...) - one account's 16 channels only cover
+    about two operators. Everything else (device list, recordings, panic,
+    downloads) uses the first account."""
+
+    def __init__(self, base_url: str, username: str, password: str, more_accounts=()):
+        self.base_url = base_url
+        self._accounts = [_Account(base_url, username, password)] + [
+            _Account(base_url, u, p) for u, p in more_accounts]
+
+    def name(self) -> str:
+        return "chemitoapi"
+
+    def _call(self, op: str, fn):
+        return self._accounts[0]._call(op, fn)
+
+    def release(self, channel_key: str) -> None:
+        """Called by StreamService once a viewer explicitly stops: starts the
+        channel's cooldown on whichever account holds it."""
+        for acct in self._accounts:
+            acct.release(channel_key)
+
     # ---- §7 live ----
 
     def resolve_live_source(self, req: StreamRequest) -> LiveSource:
@@ -162,21 +210,29 @@ class Adapter:
         # knows channels as {bus}_{cam}, never by terid.
         slot_key = f"{req.bus}_{channel}"
 
-        def fetch(client):
-            ports = client.live_ports()
-            if not ports:
-                raise VendorError("chemitoapi", "resolve live source", code="no_live_ports", retryable=True)
-            port = self._claim_port(slot_key, ports)
-            held, cooling = self._counts()
-            print(f"chemitoapi: {slot_key}: port {port} of {ports}; {held} channel(s) held, {cooling} cooling")
-            return client.live_video_url(terid, channel, req.audio, stream_type, port)
-
-        try:
-            url = self._call("resolve live video url", fetch)
-        except Exception:
-            self._drop(slot_key)  # a failed resolve must not sit on a port
-            raise
-        return LiveSource(kind=SourceKind.FLV, url=url, has_audio=True)
+        # A channel already on an account (renewal, or back to a bus just
+        # left) stays there; a new one takes the first account with room.
+        order = sorted(self._accounts, key=lambda a: not a.holds(slot_key))
+        full = None
+        for acct in order:
+            ports = acct.live_ports()
+            try:
+                port = acct._claim_port(slot_key, ports)  # in memory: a full account costs no vendor call
+            except VendorError as e:
+                full = e
+                continue
+            held, cooling = acct._counts()
+            print(f"chemitoapi: {slot_key}: {acct.username} port {port} of {ports}; "
+                  f"{held} channel(s) held, {cooling} cooling")
+            try:
+                url = acct._call("resolve live video url",
+                                 lambda c: c.live_video_url(terid, channel, req.audio, stream_type, port))
+            except Exception:
+                acct._drop(slot_key)  # a failed resolve must not sit on a port
+                acct.forget_ports()   # in case the vendor's ports changed under the cache
+                raise
+            return LiveSource(kind=SourceKind.FLV, url=url, has_audio=True)
+        raise full
 
     def list_cameras(self, vendor_params: dict) -> list:
         from domain import Camera

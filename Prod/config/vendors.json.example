@@ -8,6 +8,7 @@
   "chemitoapi": {
     "baseUrl": "http://15.252.130.159:12056",
     "username": "admin",
-    "password": ""
+    "password": "",
+    "extra": { "liveAccounts": [{ "username": "admin1" }, { "username": "admin2" }, { "username": "admin3" }, { "username": "admin4" }, { "username": "admin5" }] }
   }
 }

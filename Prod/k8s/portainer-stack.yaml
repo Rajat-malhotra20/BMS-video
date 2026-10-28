@@ -35,7 +35,9 @@ data:
   vendors.json: |
     {
       "sumithlive": { "baseUrl": "https://trakzee2.uffizio.com", "username": "vishvam@Login.com", "password": "", "extra": { "projectId": "37" } },
-      "chemitoapi": { "baseUrl": "https://itms-gateway.gna.energy:22056", "username": "media-live", "password": "" }
+      "chemitoapi": { "baseUrl": "https://itms-gateway.gna.energy:22056", "username": "media-live", "password": "",
+                      "extra": { "liveAccounts": [ { "username": "media-live1" }, { "username": "media-live2" }, { "username": "media-live3" },
+                                                   { "username": "media-live4" }, { "username": "media-live5" } ] } }
     }
   buses.json: |
     {
@@ -130,6 +132,18 @@ spec:
                   name: vendor-credentials
                   key: chemitoapi-password
                   optional: true
+            # Live-overflow accounts media-live1..5 (chemitoapi
+            # extra.liveAccounts in vendors.json above), _N = media-liveN.
+            - name: VENDOR_CHEMITOAPI_PASSWORD_1
+              valueFrom: { secretKeyRef: { name: vendor-credentials, key: chemitoapi-password-1, optional: true } }
+            - name: VENDOR_CHEMITOAPI_PASSWORD_2
+              valueFrom: { secretKeyRef: { name: vendor-credentials, key: chemitoapi-password-2, optional: true } }
+            - name: VENDOR_CHEMITOAPI_PASSWORD_3
+              valueFrom: { secretKeyRef: { name: vendor-credentials, key: chemitoapi-password-3, optional: true } }
+            - name: VENDOR_CHEMITOAPI_PASSWORD_4
+              valueFrom: { secretKeyRef: { name: vendor-credentials, key: chemitoapi-password-4, optional: true } }
+            - name: VENDOR_CHEMITOAPI_PASSWORD_5
+              valueFrom: { secretKeyRef: { name: vendor-credentials, key: chemitoapi-password-5, optional: true } }
           ports:
             - containerPort: 8080
               protocol: TCP   # the one API — GET /api/fleet, GET /api/stream/{id}, POST /api/stream/{id}/stop

@@ -175,7 +175,8 @@ consequences:
   vendor session/channel — there is no sharing any more. Ten people
   watching one camera now costs the device ten channels, not one (see
   "Things to know" below for the device's actual channel ceiling).
-- **`503` = the account's 16 channels are all in use**, for `?cam=N` or for
+- **`503` = every live channel is in use**: 16 per Chemito account (the
+  server fills account 1, then overflows to the next configured one), for `?cam=N` or for
   a whole bus where no camera could start. Show "busy, try again shortly",
   not "camera offline". A whole-bus call where only some cameras hit the
   limit still returns `200` with just the cameras that started.
