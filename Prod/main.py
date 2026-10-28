@@ -110,6 +110,9 @@ def main():
         (a.get("username", ""), a.get("password") or os.environ.get(f"VENDOR_CHEMITOAPI_PASSWORD_{n}", ""))
         for n, a in enumerate(chemito_acct.extra.get("liveAccounts", []), start=1)
     ]
+    print("chemitoapi: live accounts: " + ", ".join(
+        f"{u}{'' if p else ' (NO PASSWORD)'}"
+        for u, p in [(chemito_acct.username, chemito_acct.password), *chemito_more]))
 
     registry = Registry(
         ChemitoAdapter(chemito_acct.base_url, chemito_acct.username, chemito_acct.password, chemito_more),

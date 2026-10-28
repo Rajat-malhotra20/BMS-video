@@ -169,6 +169,23 @@ def demo_ports_cache():
     print("ok ports cache")
 
 
+def demo_broken_account():
+    """An overflow account that can't log in is skipped, not fatal."""
+    class BadLogin(FakeClient):
+        def login(self, u, p):
+            if p == "wrong":
+                raise raw.APIError(203)
+            return super().login(u, p)
+
+    mod.rawclient.Client = BadLogin
+    a = mod.Adapter("https://gw", "u1", "p", [("u2", "wrong"), ("u3", "p")])
+    for c in range(1, 18):
+        a.resolve_live_source(req("A", c))
+    assert "A_17" in a._accounts[2]._active and not a._accounts[1]._active
+    mod.rawclient.Client = FakeClient
+    print("ok broken account")
+
+
 def demo_sub_main():
     """Grid asks sub, fullscreen asks main: neither may be served the other's cached URL."""
     import api
@@ -255,6 +272,7 @@ if __name__ == "__main__":
     demo()
     demo_accounts()
     demo_ports_cache()
+    demo_broken_account()
     demo_sub_main()
     demo_bus_busy()
     demo_history_paths()

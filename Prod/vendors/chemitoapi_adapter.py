@@ -215,7 +215,12 @@ class Adapter:
         order = sorted(self._accounts, key=lambda a: not a.holds(slot_key))
         full = None
         for acct in order:
-            ports = acct.live_ports()
+            try:
+                ports = acct.live_ports()
+            except VendorError as e:  # this account's login/ports broken (e.g. bad password): try the next
+                print(f"chemitoapi: {acct.username}: skipped: {e}")
+                full = full or e
+                continue
             try:
                 port = acct._claim_port(slot_key, ports)  # in memory: a full account costs no vendor call
             except VendorError as e:
