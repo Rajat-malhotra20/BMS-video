@@ -271,9 +271,18 @@ class Adapter:
             raise VendorError("chemitoapi", "record flv video", code="no_recording")
         return {"cam": cam, "kind": SourceKind.FLV, "directUrl": url, "sn": sn}
 
-    def server_playback(self, vendor_params: dict, cam: int, start: str) -> dict:
-        """Like playback(), from the recording stored on Chemito's server."""
+    def server_playback(self, vendor_params: dict, cam: int, start: str, end: str) -> dict:
+        """Like playback(), from the recording stored on Chemito's server.
+        §8.5 hands out a URL + sn whether or not the server holds that
+        window — with no copy the gateway then answers the play.flv with
+        "500 CreateLiveStream failed" (seen live). So the server's own file
+        list (pbt=1) is checked first, letting the caller fall back to the
+        device instead of handing out a link that can never play."""
         terid = vendor_params.get("terid", "")
+        rows = self._call("server record file list",
+                          lambda c: c.record_files(terid, start, end, [cam], RECORD_STREAM_MAIN, on_server=True))
+        if not rows:
+            raise VendorError("chemitoapi", "no copy on the server", code="no_recording")
         url, sn = self._call("server flv video", lambda c: c.server_flv(terid, start, cam))
         if not url:
             raise VendorError("chemitoapi", "server flv video", code="no_recording")

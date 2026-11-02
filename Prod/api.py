@@ -58,6 +58,10 @@ CAMS_PER_BUS_CEILING = 16
 PANIC_BEFORE = 10
 PANIC_AFTER = 10
 PANIC_PLAY_SLACK = 100
+# Cameras opened per panic playback. Each one is a vendor channel taken from
+# the same account-wide pool live CCTV uses (one live port holds 4), and each
+# streams off the bus over 4G — a 9-cam bus opening all 9 starves both.
+PANIC_MAX_CAMS = 4
 
 
 class App:
@@ -224,8 +228,9 @@ class App:
             return existing
 
         if not cams:
-            n = min(self.stream.channel_counts().get(bus) or CAMS_PER_BUS_FALLBACK, CAMS_PER_BUS_CEILING)
+            n = min(self.stream.channel_counts().get(bus) or CAMS_PER_BUS_FALLBACK, PANIC_MAX_CAMS)
             cams = list(range(1, n + 1))
+        cams = cams[:PANIC_MAX_CAMS]
 
         # Per camera, first source that answers (doc §8): the copy stored on
         # Chemito's server, then the bus's own recorder as HLS of exactly the
@@ -233,7 +238,7 @@ class App:
         # stream the recording over 4G. Fallback is on API errors only - a URL
         # that later fails to play isn't caught here.
         attempts = (
-            ("server", "server_playback", lambda f, cam: f(params, cam, start)),
+            ("server", "server_playback", lambda f, cam: f(params, cam, start, end)),
             ("device-hls", "playback_range", lambda f, cam: f(params, cam, start, end)),
             ("device", "playback", lambda f, cam: f(params, cam, start)),
         )

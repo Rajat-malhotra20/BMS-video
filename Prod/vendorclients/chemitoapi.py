@@ -162,11 +162,12 @@ class Client:
 
     # ---- §8 history video (times are "YYYY-MM-DD HH:MM:SS"; st here is 1=main, 0=sub — the reverse of live) ----
 
-    def record_files(self, terid: str, start: str, end: str, channels: list, stream_type: int) -> list:
-        """GET /api/v1/basic/record/filelist — recorded segments on the device."""
+    def record_files(self, terid: str, start: str, end: str, channels: list, stream_type: int, on_server: bool = False) -> list:
+        """GET /api/v1/basic/record/filelist — recorded segments on the device
+        (pbt 0), or the copies stored on Chemito's server (pbt 1)."""
         return self._get("/api/v1/basic/record/filelist", {
             "terid": terid, "starttime": start, "endtime": end,
-            "chl": ",".join(str(c) for c in channels), "st": stream_type, "pbt": 0,
+            "chl": ",".join(str(c) for c in channels), "st": stream_type, "pbt": 1 if on_server else 0,
         }) or []
 
     def _flv(self, path: str, params: dict) -> tuple:

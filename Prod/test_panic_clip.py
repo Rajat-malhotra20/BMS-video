@@ -89,7 +89,7 @@ def demo_sources():
             super().__init__()
             self.on_server, self.with_hls = {1}, {2}
 
-        def server_playback(self, params, cam, start):
+        def server_playback(self, params, cam, start, end):
             if cam not in self.on_server:
                 raise RuntimeError("not on server")
             return {"cam": cam, "kind": "flv", "directUrl": f"s{cam}", "sn": f"srv{cam}"}
@@ -114,6 +114,50 @@ def demo_sources():
     e2 = app.panic_playback("BUS1", "2026-10-01 10:00:00", "2026-10-01 10:00:20")
     assert e2["errors"][3] == "server: not on server; device-hls: no hls; device: no recording", e2["errors"]
     print("ok sources")
+
+
+def demo_max_cams():
+    """A 9-channel bus opens only PANIC_MAX_CAMS cameras, asked-for lists included."""
+    class Cam9(Cam):
+        channels = 9
+
+    class Fake9(Fake):
+        def list_cameras(self, _): return [Cam9()]
+
+    timers.clear()
+    api.threading.Timer = CapturedTimer
+    f = Fake9()
+    app = api.App(StreamService(Registry(f)), {}, "", "*")
+    e = app.panic_playback("BUS1", "2026-10-01 08:59:55", "2026-10-01 09:00:15")
+    assert [p["cam"] for p in e["cams"]] == [1, 2, 3, 4], e["cams"]
+    e2 = app.panic_playback("BUS1", "2026-10-01 10:00:00", "2026-10-01 10:00:20", cams=[2, 5, 6, 7, 8, 9])
+    assert [p["cam"] for p in e2["cams"]] == [2, 5, 6, 7], e2["cams"]
+    print("ok max cams")
+
+
+def demo_server_check():
+    """server_playback refuses a window the server's file list doesn't hold, before asking for a URL."""
+    from vendors.chemitoapi_adapter import Adapter
+
+    class Client:
+        def __init__(self, rows): self.rows, self.flv_asked = rows, False
+        def record_files(self, terid, start, end, chl, st, on_server=False):
+            assert on_server and chl == [2], (chl, on_server)
+            return self.rows
+        def server_flv(self, terid, start, chl):
+            self.flv_asked = True
+            return "https://gw/play.flv?x", "sn9"
+
+    a = Adapter.__new__(Adapter)
+    for rows, ok in (([], False), ([{"chn": 2}], True)):
+        c = Client(rows)
+        a._call = lambda what, fn, c=c: fn(c)
+        try:
+            out = a.server_playback({"terid": "T1"}, 2, "2026-10-01 09:00:00", "2026-10-01 09:00:20")
+            assert ok and out["sn"] == "sn9"
+        except VendorError as err:
+            assert not ok and err.code == "no_recording" and not c.flv_asked
+    print("ok server check")
 
 
 def demo_http():
@@ -170,4 +214,6 @@ def demo_http():
 if __name__ == "__main__":
     demo()
     demo_sources()
+    demo_max_cams()
+    demo_server_check()
     demo_http()
